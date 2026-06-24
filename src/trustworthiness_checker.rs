@@ -14,7 +14,6 @@ use crate::{config::Args, simulation::SimulationConfig};
 
 const IDL_PACKAGE_FILTER: &str =
     "std_msgs;geometry_msgs;nav_msgs;id_pose_msgs;robo_sapiens_interfaces";
-const TRUSTWORTHINESS_CHECKER_RUST_LOG: &str = "INFO";
 
 #[derive(Resource)]
 pub struct TrustworthinessCheckerProcesses {
@@ -48,7 +47,7 @@ impl TrustworthinessCheckerProcesses {
         prebuild_checker(args, &bundle)?;
         let mut children = Vec::with_capacity(config.robots + 1);
 
-        children.push(spawn_scheduler(args, config, &bundle)?);
+        children.push(spawn_scheduler(args, &bundle)?);
         for robot_index in 0..config.robots {
             children.push(spawn_worker(args, config, &bundle, robot_index)?);
         }
@@ -71,12 +70,14 @@ struct TrustworthinessCheckerBundle {
     checker_dir: PathBuf,
     binary: PathBuf,
     spec: PathBuf,
+    worker_bootstrap_spec: PathBuf,
     input_map: PathBuf,
     output_map: PathBuf,
     graph: PathBuf,
     log_dir: PathBuf,
     tracing_log_dir: PathBuf,
     ros_setup: Option<PathBuf>,
+    rust_log: String,
 }
 
 impl TrustworthinessCheckerBundle {
@@ -119,6 +120,7 @@ impl TrustworthinessCheckerBundle {
         })?;
 
         let spec = artifact_dir.join("quadrant_pose2d.dsrv");
+        let worker_bootstrap_spec = artifact_dir.join("worker_bootstrap_empty.dsrv");
         let input_map = artifact_dir.join("quadrant_pose2d_ros_in.json");
         let output_map = artifact_dir.join("quadrant_pose2d_ros_out.json");
         let graph = artifact_dir.join("quadrant_distribution_graph.json");
@@ -150,8 +152,9 @@ impl TrustworthinessCheckerBundle {
         };
 
         write_file(&spec, &generate_spec(config))?;
+        write_file(&worker_bootstrap_spec, generate_worker_bootstrap_spec())?;
         write_file(&input_map, &generate_input_map(config))?;
-        write_file(&output_map, &generate_output_map(config))?;
+        write_file(&output_map, &generate_output_map())?;
         write_file(&graph, &generate_distribution_graph(config))?;
 
         eprintln!(
@@ -164,12 +167,14 @@ impl TrustworthinessCheckerBundle {
             checker_dir,
             binary,
             spec,
+            worker_bootstrap_spec,
             input_map,
             output_map,
             graph,
             log_dir,
             tracing_log_dir,
             ros_setup,
+            rust_log: args.trustworthiness_checker_rust_log.clone(),
         })
     }
 }
@@ -203,11 +208,7 @@ fn prebuild_checker(args: &Args, bundle: &TrustworthinessCheckerBundle) -> Resul
     Ok(())
 }
 
-fn spawn_scheduler(
-    args: &Args,
-    config: &SimulationConfig,
-    bundle: &TrustworthinessCheckerBundle,
-) -> Result<Child, String> {
+fn spawn_scheduler(args: &Args, bundle: &TrustworthinessCheckerBundle) -> Result<Child, String> {
     let mut command = checker_command(bundle);
     command
         .arg(&bundle.spec)
@@ -218,8 +219,8 @@ fn spawn_scheduler(
         .arg("--distribution-graph")
         .arg(&bundle.graph)
         .arg("--distribution-constraints");
-    for robot_index in 0..config.robots {
-        command.arg(dist_constraint_name(robot_index));
+    for quadrant in Quadrant::ALL {
+        command.arg(dist_constraint_name(quadrant));
     }
     command
         .arg("--scheduling-mode")
@@ -256,7 +257,7 @@ fn spawn_worker(
     let node = node_name(robot_index);
     let mut command = checker_command(bundle);
     command
-        .arg(&bundle.spec)
+        .arg(&bundle.worker_bootstrap_spec)
         .arg("--runtime")
         .arg("reconf-semi-sync")
         .arg("--distribution-graph")
@@ -368,7 +369,7 @@ fn apply_ros_setup_env(
 ) -> Result<(), String> {
     let Some(setup) = &bundle.ros_setup else {
         command.env("IDL_PACKAGE_FILTER", IDL_PACKAGE_FILTER);
-        command.env("RUST_LOG", TRUSTWORTHINESS_CHECKER_RUST_LOG);
+        command.env("RUST_LOG", &bundle.rust_log);
         return Ok(());
     };
 
@@ -406,7 +407,7 @@ fn apply_ros_setup_env(
         command.env(key, value);
     }
     command.env("IDL_PACKAGE_FILTER", IDL_PACKAGE_FILTER);
-    command.env("RUST_LOG", TRUSTWORTHINESS_CHECKER_RUST_LOG);
+    command.env("RUST_LOG", &bundle.rust_log);
 
     Ok(())
 }
@@ -473,7 +474,7 @@ fn log_file(
             )
         })
         .and_then(|_| writeln!(file, "idl_package_filter: {IDL_PACKAGE_FILTER}"))
-        .and_then(|_| writeln!(file, "rust_log: {TRUSTWORTHINESS_CHECKER_RUST_LOG}"))
+        .and_then(|_| writeln!(file, "rust_log: {}", bundle.rust_log))
         .and_then(|_| writeln!(file, "stream: {stream}"))
         .and_then(|_| writeln!(file, "command: {command}"))
         .and_then(|_| writeln!(file))
@@ -488,6 +489,10 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
         File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
     file.write_all(contents.as_bytes())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+fn generate_worker_bootstrap_spec() -> &'static str {
+    ""
 }
 
 fn unix_timestamp_secs() -> Result<u64, String> {
@@ -507,26 +512,17 @@ fn generate_spec(config: &SimulationConfig) -> String {
     }
     spec.push('\n');
 
-    for robot_index in 0..config.robots {
-        spec.push_str(&format!("out {}: Bool\n", trust_var(robot_index)));
+    for quadrant in Quadrant::ALL {
+        spec.push_str(&format!("out {}: Bool\n", quadrant_trust_var(quadrant)));
     }
-    for robot_index in 0..config.robots {
-        spec.push_str(&format!(
-            "out {}: Bool\n",
-            dist_constraint_name(robot_index)
-        ));
+    for quadrant in Quadrant::ALL {
+        spec.push_str(&format!("out {}: Bool\n", dist_constraint_name(quadrant)));
     }
     spec.push('\n');
 
     for robot_index in 0..config.robots {
         for quadrant in Quadrant::ALL {
             spec.push_str(&format!("aux {}\n", quadrant_var(robot_index, quadrant)));
-        }
-        for other_index in 0..config.robots {
-            spec.push_str(&format!(
-                "aux {}\n",
-                same_quadrant_var(robot_index, other_index)
-            ));
         }
     }
     spec.push('\n');
@@ -559,62 +555,63 @@ fn generate_spec(config: &SimulationConfig) -> String {
             pose,
             pose
         ));
+    }
+    spec.push('\n');
+
+    for quadrant in Quadrant::ALL {
         spec.push_str(&format!(
-            "{} = abs({}.x) <= {:.3} && abs({}.y) <= {:.3}\n",
-            trust_var(robot_index),
-            pose,
-            half_width,
-            pose,
-            half_height
+            "{} = {}\n",
+            quadrant_trust_var(quadrant),
+            quadrant_trust_expr(config, quadrant, half_width, half_height)
         ));
     }
     spec.push('\n');
 
-    for robot_index in 0..config.robots {
-        for other_index in 0..config.robots {
-            let clauses = Quadrant::ALL
-                .iter()
-                .map(|quadrant| {
-                    format!(
-                        "({} && {})",
-                        quadrant_var(robot_index, *quadrant),
-                        quadrant_var(other_index, *quadrant)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" || ");
-            spec.push_str(&format!(
-                "{} = {}\n",
-                same_quadrant_var(robot_index, other_index),
-                clauses
-            ));
-        }
-    }
-    spec.push('\n');
-
-    for robot_index in 0..config.robots {
+    for quadrant in Quadrant::ALL {
         spec.push_str(&format!(
             "{} = {}\n",
-            dist_constraint_name(robot_index),
-            distribution_constraint_expr(config, robot_index)
+            dist_constraint_name(quadrant),
+            distribution_constraint_expr(config, quadrant)
         ));
     }
 
     spec
 }
 
-fn distribution_constraint_expr(config: &SimulationConfig, robot_index: usize) -> String {
-    let mut candidate_order = (0..config.robots)
-        .filter(|candidate| *candidate != robot_index)
-        .collect::<Vec<_>>();
-    candidate_order.push(robot_index);
+fn quadrant_trust_expr(
+    config: &SimulationConfig,
+    quadrant: Quadrant,
+    half_width: f32,
+    half_height: f32,
+) -> String {
+    if config.robots == 0 {
+        return "true".to_string();
+    }
 
-    let mut expr = format!("monitored_at({}, \"None\")", trust_var(robot_index));
-    for candidate in candidate_order.into_iter().rev() {
+    (0..config.robots)
+        .map(|robot_index| {
+            let pose = pose_var(robot_index);
+            format!(
+                "(!{} || (abs({}.x) <= {:.3} && abs({}.y) <= {:.3}))",
+                quadrant_var(robot_index, quadrant),
+                pose,
+                half_width,
+                pose,
+                half_height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn distribution_constraint_expr(config: &SimulationConfig, quadrant: Quadrant) -> String {
+    let trust_var = quadrant_trust_var(quadrant);
+    let mut expr = format!("monitored_at({}, \"None\")", trust_var);
+    for candidate in (0..config.robots).rev() {
         expr = format!(
             "if {} then monitored_at({}, \"{}\") else {}",
-            same_quadrant_var(robot_index, candidate),
-            trust_var(robot_index),
+            quadrant_var(candidate, quadrant),
+            trust_var,
             node_name(candidate),
             expr
         );
@@ -636,13 +633,14 @@ fn generate_input_map(config: &SimulationConfig) -> String {
     format!("{{\n{}\n}}\n", entries)
 }
 
-fn generate_output_map(config: &SimulationConfig) -> String {
-    let entries = (0..config.robots)
-        .map(|robot_index| {
+fn generate_output_map() -> String {
+    let entries = Quadrant::ALL
+        .iter()
+        .map(|quadrant| {
             format!(
-                "  \"{}\": {{ \"topic\": \"/{}/trustworthy\", \"msg_type\": \"Bool\" }}",
-                trust_var(robot_index),
-                node_name(robot_index)
+                "  \"{}\": {{ \"topic\": \"/quadrants/{}/trustworthy\", \"msg_type\": \"Bool\" }}",
+                quadrant_trust_var(*quadrant),
+                quadrant.topic_name()
             )
         })
         .collect::<Vec<_>>()
@@ -665,14 +663,13 @@ fn generate_distribution_graph(config: &SimulationConfig) -> String {
     let mut var_names = Vec::new();
     for robot_index in 0..config.robots {
         var_names.push(pose_var(robot_index));
-        var_names.push(trust_var(robot_index));
-        var_names.push(dist_constraint_name(robot_index));
         for quadrant in Quadrant::ALL {
             var_names.push(quadrant_var(robot_index, quadrant));
         }
-        for other_index in 0..config.robots {
-            var_names.push(same_quadrant_var(robot_index, other_index));
-        }
+    }
+    for quadrant in Quadrant::ALL {
+        var_names.push(quadrant_trust_var(quadrant));
+        var_names.push(dist_constraint_name(quadrant));
     }
     let var_names = var_names
         .into_iter()
@@ -684,11 +681,7 @@ fn generate_distribution_graph(config: &SimulationConfig) -> String {
     for robot_index in 0..config.robots {
         labels.push_str(",\n");
         labels.push_str(&format!("    \"{}\": [\n", robot_index + 1));
-        labels.push_str(&format!(
-            "      \"{}\",\n      \"{}\"\n    ]",
-            pose_var(robot_index),
-            trust_var(robot_index)
-        ));
+        labels.push_str(&format!("      \"{}\"\n    ]", pose_var(robot_index)));
     }
 
     format!(
@@ -729,6 +722,24 @@ impl Quadrant {
             Quadrant::Se => "SE",
         }
     }
+
+    fn var_prefix(self) -> &'static str {
+        match self {
+            Quadrant::Ne => "ne",
+            Quadrant::Nw => "nw",
+            Quadrant::Sw => "sw",
+            Quadrant::Se => "se",
+        }
+    }
+
+    fn topic_name(self) -> &'static str {
+        match self {
+            Quadrant::Ne => "ne",
+            Quadrant::Nw => "nw",
+            Quadrant::Sw => "sw",
+            Quadrant::Se => "se",
+        }
+    }
 }
 
 fn node_name(robot_index: usize) -> String {
@@ -739,26 +750,73 @@ fn pose_var(robot_index: usize) -> String {
     format!("{}Pose", var_prefix(robot_index))
 }
 
-fn trust_var(robot_index: usize) -> String {
-    format!("{}Trustworthy", var_prefix(robot_index))
+fn quadrant_trust_var(quadrant: Quadrant) -> String {
+    format!("{}Trustworthy", quadrant.var_prefix())
 }
 
-fn dist_constraint_name(robot_index: usize) -> String {
-    format!("dist{}", robot_index + 1)
+fn dist_constraint_name(quadrant: Quadrant) -> String {
+    format!("dist{}", quadrant.suffix())
 }
 
 fn quadrant_var(robot_index: usize, quadrant: Quadrant) -> String {
     format!("{}In{}", var_prefix(robot_index), quadrant.suffix())
 }
 
-fn same_quadrant_var(robot_index: usize, other_index: usize) -> String {
-    format!(
-        "{}SameQuadrantAs{}",
-        var_prefix(robot_index),
-        node_name(other_index)
-    )
-}
-
 fn var_prefix(robot_index: usize) -> String {
     format!("r{}", robot_index + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(robots: usize) -> SimulationConfig {
+        SimulationConfig {
+            robots,
+            seed: 42,
+            arena_width: 12.0,
+            arena_height: 12.0,
+            brownian_scale: 0.4,
+            sim_hz: 60.0,
+            publish_rate_hz: 10.0,
+            robot_radius: 0.12,
+            robot_labels: false,
+            wall_avoidance_margin: 1.0,
+            wall_avoidance_strength: 2.0,
+            render_scale: 60.0,
+            trustworthiness_checker_reconf_topic: "reconfig".to_string(),
+        }
+    }
+
+    #[test]
+    fn generated_spec_uses_four_quadrant_properties() {
+        let spec = generate_spec(&config(3));
+
+        for var in [
+            "neTrustworthy",
+            "nwTrustworthy",
+            "swTrustworthy",
+            "seTrustworthy",
+        ] {
+            assert!(spec.contains(&format!("out {var}: Bool")));
+        }
+        for constraint in ["distNE", "distNW", "distSW", "distSE"] {
+            assert!(spec.contains(&format!("out {constraint}: Bool")));
+        }
+
+        assert!(!spec.contains("out r1Trustworthy: Bool"));
+        assert!(!spec.contains("out dist1: Bool"));
+    }
+
+    #[test]
+    fn quadrant_distribution_constraint_targets_matching_quadrant_nodes() {
+        let spec = generate_spec(&config(2));
+
+        assert!(spec.contains(
+            "distNE = if r1InNE then monitored_at(neTrustworthy, \"R1\") else if r2InNE then monitored_at(neTrustworthy, \"R2\") else monitored_at(neTrustworthy, \"None\")"
+        ));
+        assert!(spec.contains(
+            "distSW = if r1InSW then monitored_at(swTrustworthy, \"R1\") else if r2InSW then monitored_at(swTrustworthy, \"R2\") else monitored_at(swTrustworthy, \"None\")"
+        ));
+    }
 }

@@ -5,7 +5,7 @@ use rand_distr::StandardNormal;
 
 use crate::{
     config::Args,
-    robot::{Robot, RobotLabel, RobotPose},
+    robot::{MonitorHighlightLayer, Robot, RobotLabel, RobotMonitorCircle, RobotPose},
 };
 
 #[derive(Clone, Debug, Resource)]
@@ -22,6 +22,7 @@ pub struct SimulationConfig {
     pub wall_avoidance_margin: f32,
     pub wall_avoidance_strength: f32,
     pub render_scale: f32,
+    pub trustworthiness_checker_reconf_topic: String,
 }
 
 impl From<Args> for SimulationConfig {
@@ -39,6 +40,7 @@ impl From<Args> for SimulationConfig {
             wall_avoidance_margin: args.wall_avoidance_margin,
             wall_avoidance_strength: args.wall_avoidance_strength,
             render_scale: 60.0,
+            trustworthiness_checker_reconf_topic: args.trustworthiness_checker_reconf_topic,
         }
     }
 }
@@ -94,6 +96,8 @@ pub fn spawn_robots(
             ),
         ));
 
+        spawn_monitor_highlight(&mut commands, &config, id, x, y);
+
         if config.robot_labels {
             commands.spawn((
                 RobotLabel { robot_id: id },
@@ -113,6 +117,49 @@ pub fn spawn_robots(
     }
 
     eprintln!("INFO spawned {} robot sprites", config.robots);
+}
+
+fn spawn_monitor_highlight(
+    commands: &mut Commands,
+    config: &SimulationConfig,
+    robot_id: usize,
+    x: f32,
+    y: f32,
+) {
+    let rendered = config.render_position(x, y);
+    let layers = [
+        (
+            MonitorHighlightLayer::Glow,
+            config.render_radius() * 6.0,
+            Color::srgba(0.8, 0.0, 0.0, 0.36),
+            0.35,
+        ),
+        (
+            MonitorHighlightLayer::Ring,
+            config.render_radius() * 4.8,
+            Color::srgba(0.8, 0.0, 0.0, 0.96),
+            0.45,
+        ),
+        (
+            MonitorHighlightLayer::Cutout,
+            config.render_radius() * 3.3,
+            Color::srgba(0.08, 0.09, 0.10, 1.0),
+            0.55,
+        ),
+    ];
+
+    for (layer, diameter, color, z) in layers {
+        commands.spawn((
+            RobotMonitorCircle { robot_id, layer },
+            Sprite {
+                color,
+                custom_size: Some(Vec2::splat(diameter)),
+                ..default()
+            },
+            Transform::from_xyz(rendered.x, rendered.y, z),
+            Visibility::Hidden,
+        ));
+    }
 }
 
 pub fn move_robots(
@@ -189,6 +236,7 @@ mod tests {
             wall_avoidance_margin: 12.0,
             wall_avoidance_strength: 40.0,
             render_scale: 60.0,
+            trustworthiness_checker_reconf_topic: "reconfig".to_string(),
         };
 
         let a = run_reference_sim(&config, 20);
@@ -212,6 +260,7 @@ mod tests {
             wall_avoidance_margin: 12.0,
             wall_avoidance_strength: 40.0,
             render_scale: 60.0,
+            trustworthiness_checker_reconf_topic: "reconfig".to_string(),
         };
         let a = run_reference_sim(&config, 20);
         config.seed = 8;
@@ -242,6 +291,7 @@ mod tests {
             wall_avoidance_margin: 12.0,
             wall_avoidance_strength: 80.0,
             render_scale: 60.0,
+            trustworthiness_checker_reconf_topic: "reconfig".to_string(),
         };
 
         let poses = run_reference_sim_f32(&config, 200);

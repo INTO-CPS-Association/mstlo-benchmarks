@@ -37,6 +37,8 @@ checker inputs consume the simulation's `/robot_N/pose2d` topics as typed
 with the exact launch command for that process. Captured stdout/stderr logs are
 written directly under `logs/`; TC tracing logs are written via the checker's
 own `--log-file` support under `logs/tracing/`.
+The checker processes default to `RUST_LOG=warn`; pass
+`--trustworthiness-checker-rust-log info` when detailed TC tracing is needed.
 
 For visualization only, keep ROS sourced and disable runtime publishing:
 
@@ -85,6 +87,7 @@ ros2 topic echo /robot_0/pose2d
 --trustworthiness-checker-reconf-topic <TOPIC>
 --trustworthiness-checker-dist-graph-topic <TOPIC>
 --trustworthiness-checker-ros-setup <PATH>  # default: ../robosapiens-trustworthiness-checker/ros_interfaces/install/local_setup.bash
+--trustworthiness-checker-rust-log <FILTER> # default: warn
 ```
 
 The same seed and simulation configuration produce the same trajectory.

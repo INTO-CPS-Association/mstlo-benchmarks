@@ -75,6 +75,9 @@ pub struct Args {
         default_value = "../robosapiens-trustworthiness-checker/ros_interfaces/install/local_setup.bash"
     )]
     pub trustworthiness_checker_ros_setup: PathBuf,
+
+    #[arg(long = "trustworthiness-checker-rust-log", default_value = "warn")]
+    pub trustworthiness_checker_rust_log: String,
 }
 
 fn positive_f32(value: &str) -> Result<f32, String> {

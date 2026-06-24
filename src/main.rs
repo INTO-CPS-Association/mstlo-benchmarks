@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use clap::Parser;
 use config::Args;
 use robot::RobotPosition;
-use ros::{RosBridge, RosBridgeHandle};
+use ros::{RosBridge, RosBridgeHandle, TrustMonitorState, start_trust_monitor_reconfig_listener};
 use simulation::{SimulationConfig, SimulationRng};
 use tokio::sync::mpsc;
 use trustworthiness_checker::TrustworthinessCheckerProcesses;
@@ -34,6 +34,20 @@ fn main() {
             }
         }
     };
+    let trust_monitor_listener = if args.no_ros {
+        None
+    } else {
+        match start_trust_monitor_reconfig_listener(sim_config.clone()) {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                eprintln!("trust monitor reconfig listener disabled: {err}");
+                None
+            }
+        }
+    };
+    let (trust_monitor_updates, trust_monitor_worker) = trust_monitor_listener
+        .map(|(receiver, worker)| (Some(receiver), Some(worker)))
+        .unwrap_or((None, None));
 
     let trustworthiness_checker_processes =
         match TrustworthinessCheckerProcesses::start(&args, &sim_config) {
@@ -50,7 +64,10 @@ fn main() {
         .insert_resource(RosBridgeHandle {
             sender: position_sender,
             _worker: ros_handle,
+            trust_monitor_updates,
+            _trust_monitor_worker: trust_monitor_worker,
         })
+        .insert_resource(TrustMonitorState::new(sim_config.robots))
         .insert_resource(trustworthiness_checker_processes)
         .insert_resource(Time::<Fixed>::from_hz(sim_config.sim_hz as f64))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -69,7 +86,13 @@ fn main() {
                 ros::queue_positions.after(simulation::move_robots),
             ),
         )
-        .add_systems(Update, rendering::sync_robot_labels);
+        .add_systems(
+            Update,
+            (
+                rendering::sync_robot_labels,
+                rendering::sync_robot_monitor_circles,
+            ),
+        );
 
     app.run();
 }

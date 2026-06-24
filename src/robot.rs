@@ -35,3 +35,24 @@ impl From<(Robot, RobotPose)> for RobotPosition {
 pub struct RobotLabel {
     pub robot_id: usize,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HighlightQuadrant {
+    Ne,
+    Nw,
+    Sw,
+    Se,
+}
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorHighlightLayer {
+    Glow,
+    Ring,
+    Cutout,
+}
+
+#[derive(Component)]
+pub struct RobotMonitorCircle {
+    pub robot_id: usize,
+    pub layer: MonitorHighlightLayer,
+}
