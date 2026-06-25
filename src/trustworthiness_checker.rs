@@ -261,8 +261,6 @@ fn spawn_scheduler(args: &Args, bundle: &TrustworthinessCheckerBundle) -> Result
         .arg("tc_scheduler_main")
         .arg("--scheduler-reconf-topic")
         .arg(&args.trustworthiness_checker_reconf_topic)
-        .arg("--ros-dist-graph-topic")
-        .arg(&args.trustworthiness_checker_dist_graph_topic)
         .arg("--input-ros-file")
         .arg(&bundle.input_map)
         .arg("--output-ros-file")
