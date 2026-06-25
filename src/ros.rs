@@ -216,7 +216,7 @@ fn run_trust_monitor_reconfig_listener(
         let topic = format!("/{base_topic}_R{}", worker_id + 1);
         let Ok(subscriber) = node.subscribe::<r2r::std_msgs::msg::String>(
             &topic,
-            QosProfile::default().transient_local(),
+            QosProfile::default(),
         ) else {
             eprintln!("failed to subscribe to trust monitor reconfig topic {topic}");
             continue;

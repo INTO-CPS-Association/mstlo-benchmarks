@@ -56,8 +56,8 @@ fn spawn_machine_region_overlays(commands: &mut Commands, config: &SimulationCon
             },
             TextColor(Color::srgba(0.05, 0.06, 0.07, 1.0)),
             Transform::from_xyz(
-                rendered.x + config.render_scale * 0.45,
-                rendered.y + config.render_scale * 0.95,
+                rendered.x,
+                rendered.y + config.render_scale * 0.68,
                 0.2,
             ),
         ));
@@ -160,11 +160,27 @@ pub fn sync_robot_monitor_circles(
             transform.translation.y = rendered.y;
         }
 
-        if !monitor_state.monitored_quadrants(circle.robot_id).contains(&circle.quadrant) {
+        let monitored_quadrants = monitor_state.monitored_quadrants(circle.robot_id);
+        if !monitored_quadrants.contains(&circle.quadrant) {
             *visibility = Visibility::Hidden;
             continue;
         }
 
+        let active_index = monitored_quadrants
+            .iter()
+            .position(|quadrant| *quadrant == circle.quadrant)
+            .unwrap_or(0);
+        let scale_offset = if monitored_quadrants.len() > 1 {
+            active_index as f32 * config.render_radius() * 1.25
+        } else {
+            0.0
+        };
+        let diameter = match circle.layer {
+            MonitorHighlightLayer::Glow => config.render_radius() * 5.0 + scale_offset,
+            MonitorHighlightLayer::Ring => config.render_radius() * 4.0 + scale_offset,
+            MonitorHighlightLayer::Cutout => 0.0,
+        };
+        sprite.custom_size = Some(Vec2::splat(diameter));
         sprite.color = monitor_highlight_color(circle.quadrant, circle.layer);
         *visibility = Visibility::Visible;
     }
@@ -195,8 +211,8 @@ pub fn quadrant_color(quadrant: HighlightQuadrant, alpha: f32) -> Color {
 
 fn monitor_highlight_color(quadrant: HighlightQuadrant, layer: MonitorHighlightLayer) -> Color {
     match layer {
-        MonitorHighlightLayer::Glow => quadrant_color(quadrant, 0.36),
+        MonitorHighlightLayer::Glow => quadrant_color(quadrant, 0.22),
         MonitorHighlightLayer::Ring => quadrant_color(quadrant, 0.96),
-        MonitorHighlightLayer::Cutout => Color::srgba(0.08, 0.09, 0.10, 1.0),
+        MonitorHighlightLayer::Cutout => Color::srgba(0.0, 0.0, 0.0, 0.0),
     }
 }

@@ -210,25 +210,18 @@ fn spawn_monitor_highlight(
     .into_iter()
     .enumerate()
     {
-        let scale_offset = quadrant_index as f32 * config.render_radius() * 1.25;
         let layers = [
             (
                 MonitorHighlightLayer::Glow,
-                config.render_radius() * 6.0 + scale_offset,
+                config.render_radius() * 5.0,
                 Color::srgba(0.8, 0.0, 0.0, 0.36),
                 0.35 + quadrant_index as f32 * 0.03,
             ),
             (
                 MonitorHighlightLayer::Ring,
-                config.render_radius() * 4.8 + scale_offset,
+                config.render_radius() * 4.0,
                 Color::srgba(0.8, 0.0, 0.0, 0.96),
                 0.45 + quadrant_index as f32 * 0.03,
-            ),
-            (
-                MonitorHighlightLayer::Cutout,
-                config.render_radius() * 3.3 + scale_offset,
-                Color::srgba(0.08, 0.09, 0.10, 1.0),
-                0.55 + quadrant_index as f32 * 0.03,
             ),
         ];
 

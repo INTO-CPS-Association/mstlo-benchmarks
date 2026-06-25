@@ -616,17 +616,27 @@ fn distribution_constraint_expr(config: &SimulationConfig, property: MachineProp
         return "true".to_string();
     }
 
-    (0..config.robots)
+    let candidates = (0..config.robots)
         .map(|candidate| {
             format!(
-                "(if {} then monitored_at({}, \"{}\") else true)",
+                "({} && monitored_at({}, \"{}\"))",
                 bounding_area_var(candidate, property),
                 predicate_var,
                 node_name(candidate)
             )
         })
+        .collect::<Vec<_>>();
+
+    let any_candidate = (0..config.robots)
+        .map(|candidate| bounding_area_var(candidate, property))
         .collect::<Vec<_>>()
-        .join(" && ")
+        .join(" || ");
+
+    format!(
+        "(if ({}) then ({}) else true)",
+        any_candidate,
+        candidates.join(" || ")
+    )
 }
 
 fn generate_input_map(config: &SimulationConfig) -> String {
@@ -892,10 +902,10 @@ mod tests {
             "baR2V = (abs(r2Pose.x + 4.0) <= 5.0 && abs(r2Pose.y + 6.0) <= 5.0)"
         ));
         assert!(spec.contains(
-            "distCPred = (if baR1C then monitored_at(CPred, \"R1\") else true) && (if baR2C then monitored_at(CPred, \"R2\") else true)"
+            "distCPred = (if (baR1C || baR2C) then ((baR1C && monitored_at(CPred, \"R1\")) || (baR2C && monitored_at(CPred, \"R2\"))) else true)"
         ));
         assert!(spec.contains(
-            "distVPred = (if baR1V then monitored_at(VPred, \"R1\") else true) && (if baR2V then monitored_at(VPred, \"R2\") else true)"
+            "distVPred = (if (baR1V || baR2V) then ((baR1V && monitored_at(VPred, \"R1\")) || (baR2V && monitored_at(VPred, \"R2\"))) else true)"
         ));
     }
 

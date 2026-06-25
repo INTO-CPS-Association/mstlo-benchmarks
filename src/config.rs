@@ -22,7 +22,7 @@ pub struct Args {
     #[arg(long, default_value_t = 19.0, value_parser = positive_f32)]
     pub arena_height: f32,
 
-    #[arg(long, default_value_t = 1.5, value_parser = non_negative_f32)]
+    #[arg(long, default_value_t = 1.25, value_parser = non_negative_f32)]
     pub brownian_scale: f32,
 
     #[arg(long, default_value_t = 60.0, value_parser = positive_f32)]
