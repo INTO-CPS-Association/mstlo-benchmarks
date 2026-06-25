@@ -54,5 +54,6 @@ pub enum MonitorHighlightLayer {
 #[derive(Component)]
 pub struct RobotMonitorCircle {
     pub robot_id: usize,
+    pub quadrant: HighlightQuadrant,
     pub layer: MonitorHighlightLayer,
 }

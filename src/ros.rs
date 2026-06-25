@@ -14,23 +14,27 @@ use crate::{
     simulation::SimulationConfig,
 };
 
+const TRUST_MONITOR_LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const TRUST_MONITOR_DISCOVERY_SPINS: usize = 10;
+const TRUST_MONITOR_DISCOVERY_SPIN_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Resource)]
 pub struct RosBridgeHandle {
     pub sender: Sender<Vec<RobotPosition>>,
     pub _worker: Option<thread::JoinHandle<()>>,
-    pub trust_monitor_updates: Option<Arc<Mutex<mpsc::Receiver<Vec<Option<HighlightQuadrant>>>>>>,
+    pub trust_monitor_updates: Option<Arc<Mutex<mpsc::Receiver<Vec<Vec<HighlightQuadrant>>>>>>,
     pub _trust_monitor_worker: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Resource)]
 pub struct TrustMonitorState {
-    monitored: Vec<Option<HighlightQuadrant>>,
+    monitored: Vec<Vec<HighlightQuadrant>>,
 }
 
 impl TrustMonitorState {
     pub fn new(robots: usize) -> Self {
         Self {
-            monitored: vec![None; robots],
+            monitored: vec![Vec::new(); robots],
         }
     }
 
@@ -47,8 +51,11 @@ impl TrustMonitorState {
         }
     }
 
-    pub fn monitored_quadrant(&self, robot_id: usize) -> Option<HighlightQuadrant> {
-        self.monitored.get(robot_id).copied().flatten()
+    pub fn monitored_quadrants(&self, robot_id: usize) -> &[HighlightQuadrant] {
+        self.monitored
+            .get(robot_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -90,17 +97,32 @@ pub fn start_trust_monitor_reconfig_listener(
     config: SimulationConfig,
 ) -> Result<
     (
-        Arc<Mutex<mpsc::Receiver<Vec<Option<HighlightQuadrant>>>>>,
+        Arc<Mutex<mpsc::Receiver<Vec<Vec<HighlightQuadrant>>>>>,
         thread::JoinHandle<()>,
     ),
     String,
 > {
     let (sender, receiver) = mpsc::channel();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let receiver = Arc::new(Mutex::new(receiver));
     let handle = thread::Builder::new()
         .name("trust-monitor-reconfig-listener".to_string())
-        .spawn(move || run_trust_monitor_reconfig_listener(config, sender))
+        .spawn(move || run_trust_monitor_reconfig_listener(config, sender, ready_sender))
         .map_err(|err| format!("failed to spawn trust monitor reconfig listener: {err}"))?;
+
+    match ready_receiver.recv_timeout(TRUST_MONITOR_LISTENER_READY_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "WARN trust monitor reconfig listener did not report ready within {:?}; continuing",
+                TRUST_MONITOR_LISTENER_READY_TIMEOUT
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("trust monitor reconfig listener exited before becoming ready".to_string());
+        }
+    }
 
     Ok((receiver, handle))
 }
@@ -155,23 +177,29 @@ fn publish_positions(positions: &[RobotPosition], publishers: &[Publisher<Pose2D
 
 fn run_trust_monitor_reconfig_listener(
     config: SimulationConfig,
-    sender: mpsc::Sender<Vec<Option<HighlightQuadrant>>>,
+    sender: mpsc::Sender<Vec<Vec<HighlightQuadrant>>>,
+    ready_sender: mpsc::SyncSender<Result<(), String>>,
 ) {
     if config.robots == 0 {
+        let _ = ready_sender.send(Ok(()));
         return;
     }
 
     let ctx = match Context::create() {
         Ok(ctx) => ctx,
         Err(err) => {
-            eprintln!("failed to create ROS context for trust monitor listener: {err}");
+            let message = format!("failed to create ROS context for trust monitor listener: {err}");
+            eprintln!("{message}");
+            let _ = ready_sender.send(Err(message));
             return;
         }
     };
     let mut node = match Node::create(ctx, "trust_monitor_reconfig_listener", "") {
         Ok(node) => node,
         Err(err) => {
-            eprintln!("failed to create trust monitor reconfig listener node: {err}");
+            let message = format!("failed to create trust monitor reconfig listener node: {err}");
+            eprintln!("{message}");
+            let _ = ready_sender.send(Err(message));
             return;
         }
     };
@@ -182,13 +210,14 @@ fn run_trust_monitor_reconfig_listener(
         .trustworthiness_checker_reconf_topic
         .trim_start_matches('/')
         .to_string();
-    let assignments = Arc::new(Mutex::new(vec![None; config.robots]));
+    let assignments = Arc::new(Mutex::new(vec![Vec::new(); config.robots]));
 
     for worker_id in 0..config.robots {
         let topic = format!("/{base_topic}_R{}", worker_id + 1);
-        let Ok(subscriber) =
-            node.subscribe::<r2r::std_msgs::msg::String>(&topic, QosProfile::default())
-        else {
+        let Ok(subscriber) = node.subscribe::<r2r::std_msgs::msg::String>(
+            &topic,
+            QosProfile::default().transient_local(),
+        ) else {
             eprintln!("failed to subscribe to trust monitor reconfig topic {topic}");
             continue;
         };
@@ -208,7 +237,13 @@ fn run_trust_monitor_reconfig_listener(
         }
     }
 
+    for _ in 0..TRUST_MONITOR_DISCOVERY_SPINS {
+        node.spin_once(TRUST_MONITOR_DISCOVERY_SPIN_INTERVAL);
+        pool.run_until_stalled();
+    }
+
     eprintln!("INFO listening for trustworthiness checker reconfig topics on /{base_topic}_R*");
+    let _ = ready_sender.send(Ok(()));
 
     loop {
         node.spin_once(Duration::from_millis(100));
@@ -220,20 +255,21 @@ fn apply_reconfig_payload(
     worker_id: usize,
     robots: usize,
     payload: &str,
-    assignments: &Arc<Mutex<Vec<Option<HighlightQuadrant>>>>,
-    sender: &mpsc::Sender<Vec<Option<HighlightQuadrant>>>,
+    assignments: &Arc<Mutex<Vec<Vec<HighlightQuadrant>>>>,
+    sender: &mpsc::Sender<Vec<Vec<HighlightQuadrant>>>,
 ) {
-    let worker_quadrant = reconfig_payload_quadrant(payload);
-    match worker_quadrant {
-        Some(quadrant) => eprintln!(
+    let worker_quadrants = reconfig_payload_quadrants(payload);
+    if worker_quadrants.is_empty() {
+        eprintln!(
+            "INFO trust monitor reconfig: R{} received no machine property",
+            worker_id + 1
+        );
+    } else {
+        eprintln!(
             "INFO trust monitor reconfig: R{} is monitoring {:?}",
             worker_id + 1,
-            quadrant
-        ),
-        None => eprintln!(
-            "INFO trust monitor reconfig: R{} received no quadrant property",
-            worker_id + 1
-        ),
+            worker_quadrants
+        );
     }
 
     let Ok(mut assignments) = assignments.lock() else {
@@ -243,20 +279,26 @@ fn apply_reconfig_payload(
         return;
     };
 
-    *assignment = worker_quadrant;
+    if *assignment == worker_quadrants {
+        return;
+    }
+    *assignment = worker_quadrants;
     let mut monitored = assignments.clone();
-    monitored.resize(robots, None);
+    monitored.resize_with(robots, Vec::new);
+    let active = monitored.iter().filter(|quadrants| !quadrants.is_empty()).count();
+    eprintln!("INFO trust monitor active highlighted workers: {active}");
     let _ = sender.send(monitored);
 }
 
-fn reconfig_payload_quadrant(payload: &str) -> Option<HighlightQuadrant> {
+fn reconfig_payload_quadrants(payload: &str) -> Vec<HighlightQuadrant> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return None;
+        return Vec::new();
     };
     let Some(spec) = value.get("spec").and_then(|spec| spec.as_str()) else {
-        return None;
+        return Vec::new();
     };
 
+    let mut quadrants = Vec::new();
     for line in spec.lines().map(str::trim) {
         let Some(rest) = line.strip_prefix("out ") else {
             continue;
@@ -264,20 +306,22 @@ fn reconfig_payload_quadrant(payload: &str) -> Option<HighlightQuadrant> {
         let Some((variable, _)) = rest.split_once(':') else {
             continue;
         };
-        if let Some(quadrant) = quadrant_trust_var(variable.trim()) {
-            return Some(quadrant);
+        if let Some(quadrant) = monitored_property_quadrant(variable.trim()) {
+            if !quadrants.contains(&quadrant) {
+                quadrants.push(quadrant);
+            }
         }
     }
 
-    None
+    quadrants
 }
 
-fn quadrant_trust_var(variable: &str) -> Option<HighlightQuadrant> {
+fn monitored_property_quadrant(variable: &str) -> Option<HighlightQuadrant> {
     match variable {
-        "neTrustworthy" => Some(HighlightQuadrant::Ne),
-        "nwTrustworthy" => Some(HighlightQuadrant::Nw),
-        "swTrustworthy" => Some(HighlightQuadrant::Sw),
-        "seTrustworthy" => Some(HighlightQuadrant::Se),
+        "CPred" => Some(HighlightQuadrant::Ne),
+        "SPred" => Some(HighlightQuadrant::Se),
+        "VPred" => Some(HighlightQuadrant::Sw),
+        "HPred" => Some(HighlightQuadrant::Nw),
         _ => None,
     }
 }
@@ -289,44 +333,58 @@ mod tests {
     #[test]
     fn detects_quadrant_property_reconfig_specs() {
         let payload = serde_json::json!({
-            "spec": "in r2Pose: Struct<x: Float, y: Float, theta: Float>\nout neTrustworthy: Bool\nneTrustworthy = true\n",
+            "spec": "in ConveyorSystem: Int\nout CPred: Bool\nCPred = ConveyorSystem > 0\n",
             "type_info": {}
         })
         .to_string();
 
         assert_eq!(
-            reconfig_payload_quadrant(&payload),
-            Some(HighlightQuadrant::Ne)
+            reconfig_payload_quadrants(&payload),
+            vec![HighlightQuadrant::Ne]
         );
     }
 
     #[test]
     fn empty_or_invalid_reconfig_payload_contains_no_quadrant_property() {
-        assert_eq!(reconfig_payload_quadrant("{not json"), None);
+        assert_eq!(reconfig_payload_quadrants("{not json"), Vec::new());
         assert_eq!(
-            reconfig_payload_quadrant(&serde_json::json!({ "spec": "" }).to_string()),
-            None
+            reconfig_payload_quadrants(&serde_json::json!({ "spec": "" }).to_string()),
+            Vec::new()
         );
         assert_eq!(
-            reconfig_payload_quadrant(
+            reconfig_payload_quadrants(
                 &serde_json::json!({
                     "spec": "out r2Trustworthy: Bool\nr2Trustworthy = true\n"
                 })
                 .to_string()
             ),
-            None
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn detects_multiple_quadrant_property_reconfig_specs() {
+        let payload = serde_json::json!({
+            "spec": "in VerticalLift: Int\nin StackerCrane: Int\nout SPred: Bool\nout VPred: Bool\nSPred = true\nVPred = true\n",
+            "type_info": {}
+        })
+        .to_string();
+
+        assert_eq!(
+            reconfig_payload_quadrants(&payload),
+            vec![HighlightQuadrant::Se, HighlightQuadrant::Sw]
         );
     }
 
     #[test]
     fn detects_each_quadrant_property_name() {
         for (name, quadrant) in [
-            ("neTrustworthy", HighlightQuadrant::Ne),
-            ("nwTrustworthy", HighlightQuadrant::Nw),
-            ("swTrustworthy", HighlightQuadrant::Sw),
-            ("seTrustworthy", HighlightQuadrant::Se),
+            ("CPred", HighlightQuadrant::Ne),
+            ("SPred", HighlightQuadrant::Se),
+            ("VPred", HighlightQuadrant::Sw),
+            ("HPred", HighlightQuadrant::Nw),
         ] {
-            assert_eq!(quadrant_trust_var(name), Some(quadrant));
+            assert_eq!(monitored_property_quadrant(name), Some(quadrant));
         }
     }
 }

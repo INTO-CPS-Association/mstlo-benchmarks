@@ -5,13 +5,18 @@ use rand_distr::StandardNormal;
 
 use crate::{
     config::Args,
-    robot::{MonitorHighlightLayer, Robot, RobotLabel, RobotMonitorCircle, RobotPose},
+    robot::{
+        HighlightQuadrant, MonitorHighlightLayer, Robot, RobotLabel, RobotMonitorCircle, RobotPose,
+        RobotPosition,
+    },
 };
 
 #[derive(Clone, Debug, Resource)]
 pub struct SimulationConfig {
     pub robots: usize,
     pub seed: u64,
+    pub arena_min_x: f32,
+    pub arena_min_y: f32,
     pub arena_width: f32,
     pub arena_height: f32,
     pub brownian_scale: f32,
@@ -30,6 +35,8 @@ impl From<Args> for SimulationConfig {
         Self {
             robots: args.robots,
             seed: args.seed,
+            arena_min_x: args.arena_min_x,
+            arena_min_y: args.arena_min_y,
             arena_width: args.arena_width,
             arena_height: args.arena_height,
             brownian_scale: args.brownian_scale,
@@ -47,7 +54,42 @@ impl From<Args> for SimulationConfig {
 
 impl SimulationConfig {
     pub fn render_position(&self, x: f32, y: f32) -> Vec2 {
-        Vec2::new(x * self.render_scale, y * self.render_scale)
+        Vec2::new(
+            (x - self.arena_center_x()) * self.render_scale,
+            (y - self.arena_center_y()) * self.render_scale,
+        )
+    }
+
+    pub fn arena_max_x(&self) -> f32 {
+        self.arena_min_x + self.arena_width
+    }
+
+    pub fn arena_max_y(&self) -> f32 {
+        self.arena_min_y + self.arena_height
+    }
+
+    pub fn arena_center_x(&self) -> f32 {
+        self.arena_min_x + self.arena_width * 0.5
+    }
+
+    pub fn arena_center_y(&self) -> f32 {
+        self.arena_min_y + self.arena_height * 0.5
+    }
+
+    pub fn robot_min_x(&self) -> f32 {
+        self.arena_min_x + self.robot_radius
+    }
+
+    pub fn robot_max_x(&self) -> f32 {
+        self.arena_max_x() - self.robot_radius
+    }
+
+    pub fn robot_min_y(&self) -> f32 {
+        self.arena_min_y + self.robot_radius
+    }
+
+    pub fn robot_max_y(&self) -> f32 {
+        self.arena_max_y() - self.robot_radius
     }
 
     pub fn render_radius(&self) -> f32 {
@@ -73,12 +115,10 @@ pub fn spawn_robots(
     config: Res<SimulationConfig>,
     mut rng: ResMut<SimulationRng>,
 ) {
-    let half_width = config.arena_width * 0.5 - config.robot_radius;
-    let half_height = config.arena_height * 0.5 - config.robot_radius;
-
     for id in 0..config.robots {
-        let x = rng.rng.random_range(-half_width..half_width);
-        let y = rng.rng.random_range(-half_height..half_height);
+        let position = initial_position_for_robot(&config, &mut rng.rng, id);
+        let x = position.x;
+        let y = position.y;
         let hue = (id as f32 * 0.618_034).fract() * 360.0;
 
         commands.spawn((
@@ -119,6 +159,40 @@ pub fn spawn_robots(
     eprintln!("INFO spawned {} robot sprites", config.robots);
 }
 
+pub fn initial_robot_positions(config: &SimulationConfig) -> Vec<RobotPosition> {
+    let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+
+    (0..config.robots)
+        .map(|id| initial_position_for_robot(config, &mut rng, id))
+        .collect()
+}
+
+fn initial_position_for_robot(
+    config: &SimulationConfig,
+    rng: &mut ChaCha8Rng,
+    id: usize,
+) -> RobotPosition {
+    const DISTRIBUTED_MONITOR_STARTS: [(f32, f32); 4] =
+        [(-3.54, -5.35), (-3.60, 3.28), (1.50, 3.65), (3.78, -5.83)];
+
+    let (x, y) = DISTRIBUTED_MONITOR_STARTS
+        .get(id)
+        .copied()
+        .unwrap_or_else(|| {
+            (
+                rng.random_range(config.robot_min_x()..config.robot_max_x()),
+                rng.random_range(config.robot_min_y()..config.robot_max_y()),
+            )
+        });
+
+    RobotPosition {
+        id,
+        x: x.clamp(config.robot_min_x(), config.robot_max_x()),
+        y: y.clamp(config.robot_min_y(), config.robot_max_y()),
+        theta: 0.0,
+    }
+}
+
 fn spawn_monitor_highlight(
     commands: &mut Commands,
     config: &SimulationConfig,
@@ -127,38 +201,53 @@ fn spawn_monitor_highlight(
     y: f32,
 ) {
     let rendered = config.render_position(x, y);
-    let layers = [
-        (
-            MonitorHighlightLayer::Glow,
-            config.render_radius() * 6.0,
-            Color::srgba(0.8, 0.0, 0.0, 0.36),
-            0.35,
-        ),
-        (
-            MonitorHighlightLayer::Ring,
-            config.render_radius() * 4.8,
-            Color::srgba(0.8, 0.0, 0.0, 0.96),
-            0.45,
-        ),
-        (
-            MonitorHighlightLayer::Cutout,
-            config.render_radius() * 3.3,
-            Color::srgba(0.08, 0.09, 0.10, 1.0),
-            0.55,
-        ),
-    ];
+    for (quadrant_index, quadrant) in [
+        HighlightQuadrant::Ne,
+        HighlightQuadrant::Se,
+        HighlightQuadrant::Sw,
+        HighlightQuadrant::Nw,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let scale_offset = quadrant_index as f32 * config.render_radius() * 1.25;
+        let layers = [
+            (
+                MonitorHighlightLayer::Glow,
+                config.render_radius() * 6.0 + scale_offset,
+                Color::srgba(0.8, 0.0, 0.0, 0.36),
+                0.35 + quadrant_index as f32 * 0.03,
+            ),
+            (
+                MonitorHighlightLayer::Ring,
+                config.render_radius() * 4.8 + scale_offset,
+                Color::srgba(0.8, 0.0, 0.0, 0.96),
+                0.45 + quadrant_index as f32 * 0.03,
+            ),
+            (
+                MonitorHighlightLayer::Cutout,
+                config.render_radius() * 3.3 + scale_offset,
+                Color::srgba(0.08, 0.09, 0.10, 1.0),
+                0.55 + quadrant_index as f32 * 0.03,
+            ),
+        ];
 
-    for (layer, diameter, color, z) in layers {
-        commands.spawn((
-            RobotMonitorCircle { robot_id, layer },
-            Sprite {
-                color,
-                custom_size: Some(Vec2::splat(diameter)),
-                ..default()
-            },
-            Transform::from_xyz(rendered.x, rendered.y, z),
-            Visibility::Hidden,
-        ));
+        for (layer, diameter, color, z) in layers {
+            commands.spawn((
+                RobotMonitorCircle {
+                    robot_id,
+                    quadrant,
+                    layer,
+                },
+                Sprite {
+                    color,
+                    custom_size: Some(Vec2::splat(diameter)),
+                    ..default()
+                },
+                Transform::from_xyz(rendered.x, rendered.y, z),
+                Visibility::Hidden,
+            ));
+        }
     }
 }
 
@@ -169,8 +258,8 @@ pub fn move_robots(
 ) {
     let dt = 1.0 / config.sim_hz;
     let step_sigma = config.brownian_scale * dt.sqrt();
-    let half_width = config.arena_width * 0.5 - config.robot_radius;
-    let half_height = config.arena_height * 0.5 - config.robot_radius;
+    let min = Vec2::new(config.robot_min_x(), config.robot_min_y());
+    let max = Vec2::new(config.robot_max_x(), config.robot_max_y());
 
     let mut ordered = robots.iter_mut().collect::<Vec<_>>();
     ordered.sort_by_key(|(robot, _, _)| robot.id);
@@ -182,13 +271,14 @@ pub fn move_robots(
         let old_y = pose.y;
         let wall_drift = wall_avoidance_drift(
             Vec2::new(pose.x, pose.y),
-            Vec2::new(half_width, half_height),
+            min,
+            max,
             config.wall_avoidance_margin,
             config.wall_avoidance_strength,
         ) * dt;
 
-        pose.x = (pose.x + dx * step_sigma + wall_drift.x).clamp(-half_width, half_width);
-        pose.y = (pose.y + dy * step_sigma + wall_drift.y).clamp(-half_height, half_height);
+        pose.x = (pose.x + dx * step_sigma + wall_drift.x).clamp(min.x, max.x);
+        pose.y = (pose.y + dy * step_sigma + wall_drift.y).clamp(min.y, max.y);
         pose.theta = (pose.y - old_y).atan2(pose.x - old_x);
 
         let rendered = config.render_position(pose.x, pose.y);
@@ -197,16 +287,16 @@ pub fn move_robots(
     }
 }
 
-fn wall_avoidance_drift(position: Vec2, half_extents: Vec2, margin: f32, strength: f32) -> Vec2 {
+fn wall_avoidance_drift(position: Vec2, min: Vec2, max: Vec2, margin: f32, strength: f32) -> Vec2 {
     Vec2::new(
-        axis_wall_drift(position.x, half_extents.x, margin, strength),
-        axis_wall_drift(position.y, half_extents.y, margin, strength),
+        axis_wall_drift(position.x, min.x, max.x, margin, strength),
+        axis_wall_drift(position.y, min.y, max.y, margin, strength),
     )
 }
 
-fn axis_wall_drift(position: f32, half_extent: f32, margin: f32, strength: f32) -> f32 {
-    let distance_to_min = position + half_extent;
-    let distance_to_max = half_extent - position;
+fn axis_wall_drift(position: f32, min: f32, max: f32, margin: f32, strength: f32) -> f32 {
+    let distance_to_min = position - min;
+    let distance_to_max = max - position;
 
     if distance_to_min < margin {
         strength * (1.0 - distance_to_min / margin).clamp(0.0, 1.0)
@@ -226,6 +316,8 @@ mod tests {
         let config = SimulationConfig {
             robots: 4,
             seed: 7,
+            arena_min_x: -7.0,
+            arena_min_y: -10.5,
             arena_width: 100.0,
             arena_height: 80.0,
             brownian_scale: 3.0,
@@ -250,6 +342,8 @@ mod tests {
         let mut config = SimulationConfig {
             robots: 4,
             seed: 7,
+            arena_min_x: -50.0,
+            arena_min_y: -40.0,
             arena_width: 100.0,
             arena_height: 80.0,
             brownian_scale: 3.0,
@@ -271,9 +365,9 @@ mod tests {
 
     #[test]
     fn wall_avoidance_pushes_away_from_edges() {
-        assert!(axis_wall_drift(-47.0, 50.0, 10.0, 20.0) > 0.0);
-        assert!(axis_wall_drift(47.0, 50.0, 10.0, 20.0) < 0.0);
-        assert_eq!(axis_wall_drift(0.0, 50.0, 10.0, 20.0), 0.0);
+        assert!(axis_wall_drift(-47.0, -50.0, 50.0, 10.0, 20.0) > 0.0);
+        assert!(axis_wall_drift(47.0, -50.0, 50.0, 10.0, 20.0) < 0.0);
+        assert_eq!(axis_wall_drift(0.0, -50.0, 50.0, 10.0, 20.0), 0.0);
     }
 
     #[test]
@@ -281,6 +375,8 @@ mod tests {
         let config = SimulationConfig {
             robots: 16,
             seed: 11,
+            arena_min_x: -50.0,
+            arena_min_y: -40.0,
             arena_width: 100.0,
             arena_height: 80.0,
             brownian_scale: 25.0,
@@ -295,14 +391,15 @@ mod tests {
         };
 
         let poses = run_reference_sim_f32(&config, 200);
-        let half_width = config.arena_width * 0.5 - config.robot_radius;
-        let half_height = config.arena_height * 0.5 - config.robot_radius;
+        let min_x = config.robot_min_x();
+        let max_x = config.robot_max_x();
+        let min_y = config.robot_min_y();
+        let max_y = config.robot_max_y();
 
         assert!(
             poses
                 .iter()
-                .all(|(x, y)| (-half_width..=half_width).contains(x)
-                    && (-half_height..=half_height).contains(y))
+                .all(|(x, y)| (min_x..=max_x).contains(x) && (min_y..=max_y).contains(y))
         );
     }
 
@@ -334,6 +431,7 @@ mod tests {
                 let dy: f32 = rng.sample(StandardNormal);
                 let drift = wall_avoidance_drift(
                     Vec2::new(pose.0, pose.1),
+                    Vec2::new(-half_width, -half_height),
                     Vec2::new(half_width, half_height),
                     config.wall_avoidance_margin,
                     config.wall_avoidance_strength,

@@ -10,40 +10,131 @@ use crate::{
 
 pub fn setup_camera(mut commands: Commands, config: Res<SimulationConfig>) {
     commands.spawn(Camera2d);
+    let arena_center = config.render_position(config.arena_center_x(), config.arena_center_y());
     commands.spawn((
         Sprite {
-            color: Color::srgba(0.08, 0.09, 0.10, 1.0),
+            color: Color::WHITE,
             custom_size: Some(Vec2::new(
                 config.arena_width * config.render_scale,
                 config.arena_height * config.render_scale,
             )),
             ..default()
         },
-        Transform::from_xyz(0.0, 0.0, -1.0),
+        Transform::from_xyz(arena_center.x, arena_center.y, -1.0),
     ));
 
-    spawn_quadrant_backgrounds(&mut commands, &config);
+    spawn_machine_region_overlays(&mut commands, &config);
 }
 
-fn spawn_quadrant_backgrounds(commands: &mut Commands, config: &SimulationConfig) {
-    let quadrant_width = config.arena_width * config.render_scale * 0.5;
-    let quadrant_height = config.arena_height * config.render_scale * 0.5;
-    let x_offset = quadrant_width * 0.5;
-    let y_offset = quadrant_height * 0.5;
+fn spawn_machine_region_overlays(commands: &mut Commands, config: &SimulationConfig) {
+    let region_size = Vec2::splat(10.0 * config.render_scale);
 
-    for (quadrant, x, y) in [
-        (HighlightQuadrant::Ne, x_offset, y_offset),
-        (HighlightQuadrant::Nw, -x_offset, y_offset),
-        (HighlightQuadrant::Sw, -x_offset, -y_offset),
-        (HighlightQuadrant::Se, x_offset, -y_offset),
+    for (quadrant, label, x, y) in [
+        (HighlightQuadrant::Ne, "Conveyor System", 3.5, 3.0),
+        (HighlightQuadrant::Se, "Stacker Crane", 3.5, -6.0),
+        (HighlightQuadrant::Sw, "Vertical Lift", -4.0, -6.0),
+        (HighlightQuadrant::Nw, "Horizontal Carousel", -4.0, 3.0),
+    ] {
+        let rendered = config.render_position(x, y);
+        commands.spawn((
+            Sprite {
+                color: quadrant_color(quadrant, 0.42),
+                custom_size: Some(region_size),
+                ..default()
+            },
+            Transform::from_xyz(rendered.x, rendered.y, -0.8),
+        ));
+
+        spawn_region_border(commands, quadrant, rendered, region_size);
+        spawn_machine_marker(commands, quadrant, rendered, config.render_scale);
+
+        commands.spawn((
+            Text2d::new(label),
+            TextFont {
+                font_size: FontSize::Px(20.0),
+                ..default()
+            },
+            TextColor(Color::srgba(0.05, 0.06, 0.07, 1.0)),
+            Transform::from_xyz(
+                rendered.x + config.render_scale * 0.45,
+                rendered.y + config.render_scale * 0.95,
+                0.2,
+            ),
+        ));
+    }
+}
+
+fn spawn_machine_marker(
+    commands: &mut Commands,
+    quadrant: HighlightQuadrant,
+    center: Vec2,
+    render_scale: f32,
+) {
+    let marker_size = Vec2::new(render_scale * 1.2, render_scale * 0.7);
+    commands.spawn((
+        Sprite {
+            color: quadrant_color(quadrant, 0.92),
+            custom_size: Some(marker_size),
+            ..default()
+        },
+        Transform::from_xyz(center.x, center.y, 0.15),
+    ));
+
+    commands.spawn((
+        Sprite {
+            color: Color::srgba(0.04, 0.05, 0.06, 1.0),
+            custom_size: Some(Vec2::new(marker_size.x + 6.0, 3.0)),
+            ..default()
+        },
+        Transform::from_xyz(center.x, center.y + marker_size.y * 0.5, 0.16),
+    ));
+    commands.spawn((
+        Sprite {
+            color: Color::srgba(0.04, 0.05, 0.06, 1.0),
+            custom_size: Some(Vec2::new(marker_size.x + 6.0, 3.0)),
+            ..default()
+        },
+        Transform::from_xyz(center.x, center.y - marker_size.y * 0.5, 0.16),
+    ));
+    commands.spawn((
+        Sprite {
+            color: Color::srgba(0.04, 0.05, 0.06, 1.0),
+            custom_size: Some(Vec2::new(3.0, marker_size.y + 6.0)),
+            ..default()
+        },
+        Transform::from_xyz(center.x - marker_size.x * 0.5, center.y, 0.16),
+    ));
+    commands.spawn((
+        Sprite {
+            color: Color::srgba(0.04, 0.05, 0.06, 1.0),
+            custom_size: Some(Vec2::new(3.0, marker_size.y + 6.0)),
+            ..default()
+        },
+        Transform::from_xyz(center.x + marker_size.x * 0.5, center.y, 0.16),
+    ));
+}
+
+fn spawn_region_border(
+    commands: &mut Commands,
+    quadrant: HighlightQuadrant,
+    center: Vec2,
+    size: Vec2,
+) {
+    let color = quadrant_color(quadrant, 0.90);
+    let thickness = 4.0;
+    for (x, y, w, h) in [
+        (center.x, center.y + size.y * 0.5, size.x, thickness),
+        (center.x, center.y - size.y * 0.5, size.x, thickness),
+        (center.x - size.x * 0.5, center.y, thickness, size.y),
+        (center.x + size.x * 0.5, center.y, thickness, size.y),
     ] {
         commands.spawn((
             Sprite {
-                color: quadrant_color(quadrant, 0.16),
-                custom_size: Some(Vec2::new(quadrant_width, quadrant_height)),
+                color,
+                custom_size: Some(Vec2::new(w, h)),
                 ..default()
             },
-            Transform::from_xyz(x, y, -0.8),
+            Transform::from_xyz(x, y, 0.1),
         ));
     }
 }
@@ -69,12 +160,12 @@ pub fn sync_robot_monitor_circles(
             transform.translation.y = rendered.y;
         }
 
-        let Some(quadrant) = monitor_state.monitored_quadrant(circle.robot_id) else {
+        if !monitor_state.monitored_quadrants(circle.robot_id).contains(&circle.quadrant) {
             *visibility = Visibility::Hidden;
             continue;
-        };
+        }
 
-        sprite.color = monitor_highlight_color(quadrant, circle.layer);
+        sprite.color = monitor_highlight_color(circle.quadrant, circle.layer);
         *visibility = Visibility::Visible;
     }
 }
