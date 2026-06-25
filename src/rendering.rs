@@ -170,15 +170,32 @@ pub fn sync_robot_monitor_circles(
             .iter()
             .position(|quadrant| *quadrant == circle.quadrant)
             .unwrap_or(0);
-        let scale_offset = if monitored_quadrants.len() > 1 {
-            active_index as f32 * config.render_radius() * 1.25
+        let stack_index = if monitored_quadrants.len() > 1 {
+            monitored_quadrants
+                .len()
+                .saturating_sub(1)
+                .saturating_sub(active_index)
         } else {
-            0.0
+            0
         };
-        let diameter = match circle.layer {
-            MonitorHighlightLayer::Glow => config.render_radius() * 5.0 + scale_offset,
-            MonitorHighlightLayer::Ring => config.render_radius() * 4.0 + scale_offset,
+        let scale_offset = stack_index as f32 * config.render_radius() * 1.25;
+        transform.translation.z = match circle.layer {
+            MonitorHighlightLayer::Glow => 0.35 + active_index as f32 * 0.08,
+            MonitorHighlightLayer::Ring => 0.45 + active_index as f32 * 0.08,
             MonitorHighlightLayer::Cutout => 0.0,
+        };
+        let diameter = if monitored_quadrants.len() > 1 {
+            match circle.layer {
+                MonitorHighlightLayer::Glow => config.render_radius() * 5.0 + scale_offset,
+                MonitorHighlightLayer::Ring => config.render_radius() * 4.0 + scale_offset,
+                MonitorHighlightLayer::Cutout => 0.0,
+            }
+        } else {
+            match circle.layer {
+                MonitorHighlightLayer::Glow => config.render_radius() * 5.0,
+                MonitorHighlightLayer::Ring => config.render_radius() * 4.0,
+                MonitorHighlightLayer::Cutout => 0.0,
+            }
         };
         sprite.custom_size = Some(Vec2::splat(diameter));
         sprite.color = monitor_highlight_color(circle.quadrant, circle.layer);

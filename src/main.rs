@@ -10,8 +10,7 @@ use clap::Parser;
 use config::Args;
 use robot::RobotPosition;
 use ros::{RosBridge, RosBridgeHandle, TrustMonitorState, start_trust_monitor_reconfig_listener};
-use simulation::{SimulationConfig, SimulationRng, initial_robot_positions};
-use std::{thread, time::Duration};
+use simulation::{SimulationConfig, SimulationRng};
 use tokio::sync::mpsc;
 use trustworthiness_checker::TrustworthinessCheckerProcesses;
 
@@ -50,9 +49,6 @@ fn main() {
         .map(|(receiver, worker)| (Some(receiver), Some(worker)))
         .unwrap_or((None, None));
 
-    if !args.no_ros && args.trustworthiness_checker {
-        publish_initial_positions_for_scheduler(sim_config.clone(), position_sender.clone());
-    }
     let trustworthiness_checker_processes =
         match TrustworthinessCheckerProcesses::start(&args, &sim_config) {
             Ok(processes) => processes,
@@ -99,21 +95,4 @@ fn main() {
         );
 
     app.run();
-}
-
-fn publish_initial_positions_for_scheduler(
-    config: SimulationConfig,
-    sender: tokio::sync::mpsc::Sender<Vec<RobotPosition>>,
-) {
-    let positions = initial_robot_positions(&config);
-    let interval = Duration::from_secs_f32(1.0 / config.publish_rate_hz.max(1.0));
-    thread::Builder::new()
-        .name("ros-initial-position-bootstrap".to_string())
-        .spawn(move || {
-            for _ in 0..120 {
-                let _ = sender.try_send(positions.clone());
-                thread::sleep(interval);
-            }
-        })
-        .expect("failed to spawn initial ROS position bootstrap");
 }
