@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.95-bookworm AS build
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/trustworthiness-checker
+
+# Copy manifests first to maximize dependency cache hits across source-only changes.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY libs ./libs
+
+# Copy manifest-referenced targets required for Cargo manifest validation.
+COPY src/lib.rs src/main.rs ./src/
+COPY src/bin ./src/bin
+COPY benches ./benches
+
+# Pre-fetch dependencies into persistent BuildKit caches.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo fetch --locked
+
+# Copy full compile inputs after dependency resolution for better layer reuse.
+COPY src ./src
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/cargo-target \
+    cargo build --release --locked --target-dir /cargo-target \
+    && cp /cargo-target/release/trustworthiness_checker /opt/trustworthiness-checker/trustworthiness_checker \
+    && strip /opt/trustworthiness-checker/trustworthiness_checker
+
+FROM debian:bookworm-slim AS deploy
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libssl3 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/trustworthiness-checker/trustworthiness_checker /usr/local/bin/trustworthiness_checker
+
+ENTRYPOINT ["/usr/local/bin/trustworthiness_checker"]

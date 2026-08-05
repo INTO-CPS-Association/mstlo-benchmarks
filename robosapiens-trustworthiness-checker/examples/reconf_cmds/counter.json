@@ -1,0 +1,8 @@
+{
+  "spec": "in x\nout z\nz = default(z[1], 0) + x",
+  "type_info": {
+    "x": "Int32",
+    "z": "Int32"
+  },
+  "topic_mapping": {}
+}

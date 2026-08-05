@@ -1,0 +1,496 @@
+use std::str::FromStr;
+use ecow::{EcoString, EcoVec};
+
+use crate::lang::dsrv::ast::{ExprBuilder, DynamicExprScope, ExprKind, ExprId, VarOrNodeName};
+use crate::lang::dsrv::parser::Declaration;
+use crate::core::{BinaryOperator, Value, VarName, StreamType, StreamTypeAscription};
+use crate::lang::dsrv::span::Span;
+use crate::distributed::distribution_graphs::NodeName;
+
+grammar(builder: &mut ExprBuilder);
+
+// Macro to automatically wrap parsed nodes with their span information
+MakeSpanned<T>: ExprId = {
+    <l:@L> <node:T> <r:@R> => builder.alloc(node, Span::new(l as u32, r as u32))
+};
+
+// -----------------------------------------------------------------------------
+// Tokens
+// -----------------------------------------------------------------------------
+match {
+    r"[ \t\r\n\x0B\x0C]+" => { }, // Ignore ASCII whitespace
+    r"//[^\n\r]*[\n\r]*" => { }, // Ignore `// comments`
+    r#"\(\*[^*]*\*+(?:[^\)*][^*]*\*+)*\)"# => { },  // Ignore `(* comments *)`
+} else {
+    _
+}
+
+RawIdent: &'input str = <s:r"[A-Za-z_][A-Za-z0-9_]*"> => s;
+Ident: VarName = <s:RawIdent> => VarName::from(s);
+Uint: u64 = <s:r"[0-9]+"> => u64::from_str(s).unwrap();
+// Negative numbers handled in unary minus - but need a separate case to not accept
+// numbers too large for i64 here.
+Int: i64 = <s:r"[0-9]+"> => i64::from_str(s).unwrap();
+Float: f64 = <s:r"(?:0|[1-9][0-9]*)\.[0-9]*(?:[eE]-?[0-9]+)?"> => f64::from_str(s).unwrap();
+Bool: bool = {
+    "true" => true,
+    "false" => false
+};
+String: EcoString = <s:r#""[^\\"\n\r]*(?:\\[tn'"\\][^\\"\n\r]*)*""#> => s[1..s.len()-1].into();
+VarOrNodeName: VarOrNodeName = {
+    RawIdent => VarOrNodeName((<>).to_owned()),
+    String => VarOrNodeName((<>).to_string()),
+};
+PlacementNode: NodeName = {
+    RawIdent => NodeName::new((<>).to_owned()),
+    String => NodeName::new((<>).to_string()),
+};
+
+// -----------------------------------------------------------------------------
+// Macros / generic helpers
+// -----------------------------------------------------------------------------
+
+
+
+// A list of elements separated by Sep
+SepList<T, Sep>: EcoVec<T> = {
+    <mut v:(<T> Sep)*> <e:T> => {
+        v.push(e);
+        v.into()
+    }
+};
+
+// An optional list of elements separated by Sep
+SepListOpt<T, Sep>: EcoVec<T> = {
+    SepList<T, Sep>,
+    => EcoVec::new(),
+};
+
+// Key-value pair:
+KVPair<K, V>: (K, V) = {
+    <k: K> ":" <v: V> => (k, v)
+};
+
+ExprKVPair: (EcoString, ExprId) = {
+    <k: String> ":" <v: Expr> => (k, v)
+};
+
+ObjectLiteralKey: EcoString = {
+    <id: RawIdent> => EcoString::from(id),
+    String => <>,
+};
+
+ObjectLiteralKVPair: (EcoString, ExprId) = {
+    <k: ObjectLiteralKey> ":" <v: Expr> => (k, v)
+};
+
+VarSet: EcoVec<VarName> = {
+    "{" <vars: SepListOpt<Ident, ",">> "}" => vars,
+};
+
+ExprList: EcoVec<ExprId> = {
+    <items: SepListOpt<Expr, ",">> => items
+};
+
+LambdaParam: (VarName, StreamType) = {
+    <name: Ident> ":" <typ: StreamTyp> => (name, typ),
+}
+
+// -----------------------------------------------------------------------------
+// Terminals / simple expressions
+// -----------------------------------------------------------------------------
+
+// Literal values mapped to Value
+LiteralVal: Value = {
+    Int => Value::Int(<>),
+    Float => Value::Float(<>),
+    Bool => Value::Bool(<>),
+    String => Value::Str(<>),
+    "(" ")" => Value::Unit,
+}
+
+// Literal expression wrapper
+SpannedLiteral: ExprId = MakeSpanned<Literal>;
+Literal: ExprKind = {
+    LiteralVal => ExprKind::Val(<>),
+};
+
+// Parenthesized expression
+SpannedParen: ExprId = "(" <e:Expr> ")" => e;
+
+// Identifier as an ExprKind (variable reference)
+SpannedIdentExprKind: ExprId = MakeSpanned<IdentExprKind>;
+IdentExprKind : ExprKind = {
+    Ident => ExprKind::Var(<>),
+};
+
+// Helpers for indexing base (literal, ident, or paren)
+SIndexHelp: ExprId = {
+    SpannedLiteral,
+    SpannedIdentExprKind,
+    SpannedParen
+};
+
+// Indexing expression e[idx]
+SIndex: ExprId = {
+  <l:@L> <expr: SIndexHelp> "[" <idx: Uint> "]" <r:@R> => {
+        builder.alloc(ExprKind::SIndex(expr, idx), Span::new(l as u32, r as u32))
+    },
+};
+
+// Container constructors
+ContainerExpr: ExprId = {
+  <l:@L> "[" <v:ExprList> "]" <r:@R> => {
+        builder.alloc(ExprKind::List(v), Span::new(l as u32, r as u32))
+    },
+  <l:@L> "List" "(" <v:ExprList> ")" <r:@R> => {
+        builder.alloc(ExprKind::List(v), Span::new(l as u32, r as u32))
+    },
+  <l:@L> "Tuple" "(" <v:ExprList> ")" <r:@R> => {
+        builder.alloc(ExprKind::Tuple(v), Span::new(l as u32, r as u32))
+    },
+  <l:@L> "Map" "(" <kv_pairs: SepListOpt<ExprKVPair, ",">> ")" <r:@R> => {
+        builder.alloc(ExprKind::Map(kv_pairs.into()), Span::new(l as u32, r as u32))
+    },
+  <l:@L> "Struct" "(" <kv_pairs: SepListOpt<ExprKVPair, ",">> ")" <r:@R> => {
+        builder.alloc(ExprKind::Struct(kv_pairs.into()), Span::new(l as u32, r as u32))
+    },
+  <l:@L> "{" <kv_pairs: SepListOpt<ObjectLiteralKVPair, ",">> "}" <r:@R> => {
+        builder.alloc(ExprKind::ObjectLiteral(kv_pairs.into()), Span::new(l as u32, r as u32))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Special keywords / builtins (function-like forms)
+// -----------------------------------------------------------------------------
+
+SpecialKeywords: ExprId = {
+  <l:@L> "dynamic" "(" <e: Expr> "," <vs: VarSet> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Unascribed, DynamicExprScope::Explicit(vs)), Span::new(l as u32, r as u32)),
+  <l:@L> "dynamic" "(" <e: Expr> <t: TypeAnno> "," <vs: VarSet> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Ascribed(t), DynamicExprScope::Explicit(vs)), Span::new(l as u32, r as u32)),
+  <l:@L> "dynamic" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Unascribed, DynamicExprScope::Automatic), Span::new(l as u32, r as u32)),
+  <l:@L> "dynamic" "(" <e: Expr> <t: TypeAnno> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Ascribed(t), DynamicExprScope::Automatic), Span::new(l as u32, r as u32)),
+  <l:@L> "eval" "(" <e: Expr> "," <vs: VarSet> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Unascribed, DynamicExprScope::Explicit(vs)), Span::new(l as u32, r as u32)),
+  <l:@L> "eval" "(" <e: Expr> <t: TypeAnno> "," <vs: VarSet> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Ascribed(t), DynamicExprScope::Explicit(vs)), Span::new(l as u32, r as u32)),
+  <l:@L> "eval" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Unascribed, DynamicExprScope::Automatic), Span::new(l as u32, r as u32)),
+  <l:@L> "eval" "(" <e: Expr> <t: TypeAnno> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dynamic(e, StreamTypeAscription::Ascribed(t), DynamicExprScope::Automatic), Span::new(l as u32, r as u32)),
+  <l:@L> "defer" "(" <e: Expr> "," <vs: VarSet> ")" <r:@R> =>
+       builder.alloc(ExprKind::Defer(e, StreamTypeAscription::Unascribed, DynamicExprScope::Explicit(vs)), Span::new(l as u32, r as u32)),
+  <l:@L> "defer" "(" <e: Expr> <t: TypeAnno> "," <vs: VarSet> ")" <r:@R> =>
+       builder.alloc(ExprKind::Defer(e, StreamTypeAscription::Ascribed(t), DynamicExprScope::Explicit(vs)), Span::new(l as u32, r as u32)),
+  <l:@L> "defer" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Defer(e, StreamTypeAscription::Unascribed, DynamicExprScope::Automatic), Span::new(l as u32, r as u32)),
+  <l:@L> "defer" "(" <e: Expr> <t: TypeAnno> ")" <r:@R> =>
+       builder.alloc(ExprKind::Defer(e, StreamTypeAscription::Ascribed(t), DynamicExprScope::Automatic), Span::new(l as u32, r as u32)),
+  <l:@L> "update" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Update(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "default" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Default(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "is_defined" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::IsDefined(e), Span::new(l as u32, r as u32)),
+  <l:@L> "when" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::When(e), Span::new(l as u32, r as u32)),
+  <l:@L> "latch" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Latch(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "init" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Init(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "List.get" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LIndex(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "List.concat" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LConcat(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "List.append" "(" <e1: Expr> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LAppend(e1, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "List.head" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LHead(e), Span::new(l as u32, r as u32)),
+  <l:@L> "List.tail" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LTail(e), Span::new(l as u32, r as u32)),
+  <l:@L> "List.len" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LLen(e), Span::new(l as u32, r as u32)),
+  <l:@L> "List.map" "(" <f: Expr> "," <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LMap(f, e), Span::new(l as u32, r as u32)),
+  <l:@L> "List.filter" "(" <f: Expr> "," <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LFilter(f, e), Span::new(l as u32, r as u32)),
+  <l:@L> "List.fold" "(" <f: Expr> "," <init: Expr> "," <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::LFold(f, init, e), Span::new(l as u32, r as u32)),
+  <l:@L> "fix" "(" <f: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Fix(f), Span::new(l as u32, r as u32)),
+  <l:@L> "partial" "(" <f: Expr> <args:("," <Expr>)*> ")" <r:@R> =>
+       builder.alloc(ExprKind::Partial(f, args.into()), Span::new(l as u32, r as u32)),
+  <l:@L> "Map.get" "(" <e: Expr> "," <k: String> ")" <r:@R> =>
+       builder.alloc(ExprKind::MGet(e, k), Span::new(l as u32, r as u32)),
+  <l:@L> "Map.remove" "(" <e: Expr> "," <k: String> ")" <r:@R> =>
+       builder.alloc(ExprKind::MRemove(e, k), Span::new(l as u32, r as u32)),
+  <l:@L> "Map.has_key" "(" <e: Expr> "," <k: String> ")" <r:@R> =>
+       builder.alloc(ExprKind::MHasKey(e, k), Span::new(l as u32, r as u32)),
+  <l:@L> "Map.insert" "(" <e1: Expr> "," <k: String> "," <e2: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::MInsert(e1, k, e2), Span::new(l as u32, r as u32)),
+  <l:@L> "sin" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Sin(e), Span::new(l as u32, r as u32)),
+  <l:@L> "cos" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Cos(e), Span::new(l as u32, r as u32)),
+  <l:@L> "tan" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Tan(e), Span::new(l as u32, r as u32)),
+  <l:@L> "abs" "(" <e: Expr> ")" <r:@R> =>
+       builder.alloc(ExprKind::Abs(e), Span::new(l as u32, r as u32)),
+  <l:@L> "monitored_at" "(" <v: Ident> "," <n: PlacementNode> ")" <r:@R> =>
+       builder.alloc(ExprKind::MonitoredAt(v, n), Span::new(l as u32, r as u32)),
+  <l:@L> "dist" "(" <v1: VarOrNodeName> "," <v2: VarOrNodeName> ")" <r:@R> =>
+       builder.alloc(ExprKind::Dist(v1, v2), Span::new(l as u32, r as u32)),
+}
+
+// -----------------------------------------------------------------------------
+// Atom (base expressions with same precedence)
+// -----------------------------------------------------------------------------
+
+AtomBase: ExprId = {
+    SIndex,
+    SpecialKeywords,
+    SpannedLiteral,
+    ContainerExpr,
+    SpannedIdentExprKind,
+    SpannedParen
+}
+
+
+
+FieldName: EcoString = {
+    <field: RawIdent> => field.into(),
+    <idx: Uint> => idx.to_string().into(),
+}
+
+// Calls and field accesses allocate each prefix immediately, preserving postorder
+// construction and giving every generated node its exact source span.
+Atom: ExprId = {
+    AtomBase,
+    <base: Atom> "(" <args: SepListOpt<Expr, ",">> ")" <r:@R> => {
+        let start = builder.metadata(base).start;
+        builder.alloc(ExprKind::Apply(base, args), Span::new(start, r as u32))
+    },
+    <base: Atom> "." <field: FieldName> <r:@R> => {
+        let start = builder.metadata(base).start;
+        builder.alloc(ExprKind::SGet(base, field), Span::new(start, r as u32))
+    },
+}
+
+// -----------------------------------------------------------------------------
+// Unary expressions
+// -----------------------------------------------------------------------------
+
+UnaryExpr<Next>: ExprId = {
+   <l:@L> "-" <x: UnaryExpr<Next>> <r:@R> => {
+        builder.alloc(ExprKind::Neg(x), Span::new(l as u32, r as u32))
+   },
+   <l:@L> "!" <b: UnaryExpr<Next>> <r:@R> => {
+        builder.alloc(ExprKind::Not(b), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+// -----------------------------------------------------------------------------
+// Binary operators
+// -----------------------------------------------------------------------------
+
+// Multiplicative helpers
+MultExprHelp: BinaryOperator  = {
+    "*" => BinaryOperator::Multiply,
+    "/" => BinaryOperator::Divide,
+    "%" => BinaryOperator::Modulo,
+};
+
+MultExpr<Next>: ExprId = {
+  <l:@L>  <lhs: MultExpr<Next>> <op: MultExprHelp> <rhs: Next> <r:@R> => {
+    builder.alloc(ExprKind::BinOp(lhs, rhs, op), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+// Additive helpers
+AddExprHelp: BinaryOperator  = {
+    "+" => BinaryOperator::Add,
+    "-" => BinaryOperator::Subtract,
+};
+
+AddExpr<Next>: ExprId = {
+   <l:@L> <lhs: AddExpr<Next>> <op: AddExprHelp> <rhs: Next> <r:@R> => {
+        builder.alloc(ExprKind::BinOp(lhs, rhs, op), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+// Relational operators ( < <= > >= )
+RelExprHelp: BinaryOperator = {
+    "<=" => BinaryOperator::LessEqual,
+    ">=" => BinaryOperator::GreaterEqual,
+    "<" => BinaryOperator::Less,
+    ">" => BinaryOperator::Greater,
+}
+
+RelExpr<Next>: ExprId ={
+  <l:@L>  <lhs: RelExpr<Next>> <op: RelExprHelp> <rhs: Next> <r:@R> => {
+        builder.alloc(ExprKind::BinOp(lhs, rhs, op), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+// Comparison (==)
+CompExprHelp: BinaryOperator = {
+    "==" => BinaryOperator::Equal,
+    // "!=" => BinaryOperator::NotEqual, // Not implemented yet
+}
+
+CompExpr<Next>: ExprId = {
+   <l:@L> <lhs: CompExpr<Next>> <op: CompExprHelp> <rhs: Next> <r:@R> => {
+        builder.alloc(ExprKind::BinOp(lhs, rhs, op), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+// Boolean
+AndExpr<Next>: ExprId = {
+  <l:@L>  <lhs: AndExpr<Next>> "&&" <rhs: Next> <r:@R> => {
+        builder.alloc(ExprKind::BinOp(lhs, rhs, BinaryOperator::And), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+OrExpr<Next>: ExprId = {
+   <l:@L> <lhs: OrExpr<Next>> "||" <rhs: Next> <r:@R> => {
+        builder.alloc(ExprKind::BinOp(lhs, rhs, BinaryOperator::Or), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+ImplExpr<Next>: ExprId = {
+   <l:@L> <lhs: ImplExpr<Next>> "=>" <rhs: Next> <r:@R> => {
+        builder.alloc(ExprKind::BinOp(lhs, rhs, BinaryOperator::Implication), Span::new(l as u32, r as u32))
+    },
+    Next
+};
+
+// String concat
+ConcatExpr<Next>: ExprId = {
+   <l:@L> <lhs: ConcatExpr<Next>> "++" <rhs: Next> <r:@R> => {
+                builder.alloc(ExprKind::BinOp(lhs, rhs, BinaryOperator::Concatenate), Span::new(l as u32, r as u32))
+    },
+    Next
+}
+
+// -----------------------------------------------------------------------------
+// If-then-else (binds weaker than the precedence chain)
+// -----------------------------------------------------------------------------
+
+Ifelse: ExprId = {
+   <l:@L>  "if" <c: Expr> "then" <i: Expr> "else" <e: Expr> <r:@R> => {
+    builder.alloc(ExprKind::If(c, i, e), Span::new(l as u32, r as u32))
+   }
+}
+
+LambdaExpr: ExprId = {
+   <l:@L> "\\" <params: SepList<LambdaParam, ",">> "->" <body: Expr> <r:@R> => {
+    builder.alloc(ExprKind::Lambda(params, body), Span::new(l as u32, r as u32))
+   }
+}
+
+// -----------------------------------------------------------------------------
+// Types / annotations
+// -----------------------------------------------------------------------------
+
+StructTypeField: (EcoString, StreamType) = {
+    <name: RawIdent> ":" <typ: StreamTyp> => (name.into(), typ),
+}
+
+StructPermissiveFields: EcoVec<(EcoString, StreamType)> = {
+    "..." => EcoVec::new(),
+    <mut fields:(<StructTypeField> ",")*> <field: StructTypeField> "," "..." => {
+        fields.push(field);
+        fields.into()
+    },
+}
+
+StreamTyp: StreamType = {
+    "Int" => StreamType::Int,
+    "Str" => StreamType::Str,
+    "Float" => StreamType::Float,
+    "Bool" => StreamType::Bool,
+    "Unit" => StreamType::Unit,
+    "Any" => StreamType::Any,
+    "List" "<" <inner: StreamTyp> ">" => StreamType::List(Box::new(inner)),
+    "Map" "<" <inner: StreamTyp> ">" => StreamType::Map(Box::new(inner)),
+    "Struct" "<" <fields: StructPermissiveFields> ">" => StreamType::Struct(fields, true),
+    "Struct" "<" <fields: SepListOpt<StructTypeField, ",">> ">" => StreamType::Struct(fields, false),
+    "(" <first: StreamTyp> "," ")" => {
+        let mut elems = EcoVec::new();
+        elems.push(first);
+        StreamType::Tuple(elems)
+    },
+    "(" <first: StreamTyp> "," <second: StreamTyp> <rest:("," <StreamTyp>)*> ")" => {
+        let mut elems = EcoVec::new();
+        elems.push(first);
+        elems.push(second);
+        elems.extend(rest);
+        StreamType::Tuple(elems)
+    },
+    "(" <arg: StreamTyp> "->" <ret: StreamTyp> ")" => {
+        StreamType::Function(EcoVec::from(vec![arg]), Box::new(ret))
+    },
+}
+
+TypeAnno: StreamType = {
+    ":" <StreamTyp> => <>
+}
+
+// -----------------------------------------------------------------------------
+// Precedence chain: compose operator precedence from lowest → highest
+// -----------------------------------------------------------------------------
+
+// Operator precedence chain with Final having highest precedence
+PrecChain<Final>: ExprId = {
+    ConcatExpr<ImplExpr<OrExpr<AndExpr<CompExpr<RelExpr<AddExpr<MultExpr<UnaryExpr<Final>>>>>>>>>,
+}
+
+// The top-level expression
+pub Expr: ExprId = {
+    Ifelse, // If-else binds weaker than the PrecChain chain to handle dangling else, i.e., if a then b else c + d is parsed as if a then b else (c + d)
+    LambdaExpr,
+    PrecChain<Atom>
+};
+
+// -----------------------------------------------------------------------------
+// Top-level declarations
+// -----------------------------------------------------------------------------
+
+InputDecl: Declaration = {
+   <l:@L> "in" <id: Ident> <typ: TypeAnno?> <r:@R>=>
+   Declaration::Input(id, typ, Span::new(l as u32, r as u32))
+};
+
+OutputDecl: Declaration = {
+   <l:@L> "out" <id: Ident> <typ: TypeAnno?> <r:@R> => Declaration::Output(id, typ, Span::new(l as u32, r as u32)),
+};
+
+AuxDecl: Declaration = {
+   <l:@L> "aux" <id: Ident> <typ: TypeAnno?> <r:@R> => Declaration::Aux(id, typ, Span::new(l as u32, r as u32)),
+   <l:@L> "var" <id: Ident> <typ: TypeAnno?> <r:@R> => Declaration::Aux(id, typ, Span::new(l as u32, r as u32)),
+};
+
+Assignment: Declaration = {
+   <l:@L> <var: Ident> "=" <expr: Expr> <r:@R> => Declaration::Assignment(var, expr, Span::new(l as u32, r as u32))
+}
+
+Declaration: Declaration = {
+    InputDecl,
+    OutputDecl,
+    AuxDecl,
+    Assignment
+}
+
+pub Declarations: EcoVec<Declaration> = {
+   Declaration* => <>.into()
+}

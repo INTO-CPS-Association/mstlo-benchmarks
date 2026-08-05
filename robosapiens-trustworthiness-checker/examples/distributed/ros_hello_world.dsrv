@@ -1,0 +1,9 @@
+in x
+in d
+in c
+out z
+out v
+out w
+z = x
+v = c <= 200
+w = d <= 100

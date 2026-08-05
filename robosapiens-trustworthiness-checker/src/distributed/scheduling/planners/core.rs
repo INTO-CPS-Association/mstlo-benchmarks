@@ -1,0 +1,81 @@
+use std::{collections::BTreeMap, rc::Rc};
+
+use async_trait::async_trait;
+use tracing::info;
+
+use crate::{
+    VarName,
+    distributed::distribution_graphs::{
+        DistributionGraph, LabelledDistributionGraph, NodeName, graph_to_png,
+    },
+    distributed::scheduling::planning_context::PlanningContext,
+};
+
+#[async_trait(?Send)]
+pub trait SchedulerPlanner {
+    async fn plan(
+        &self,
+        graph: Rc<DistributionGraph>,
+        scheduler_tick: usize,
+        planning_context: Option<PlanningContext>,
+    ) -> Option<Rc<LabelledDistributionGraph>>;
+}
+
+pub struct StaticFixedSchedulerPlanner {
+    pub fixed_graph: Rc<LabelledDistributionGraph>,
+}
+
+#[async_trait(?Send)]
+impl SchedulerPlanner for StaticFixedSchedulerPlanner {
+    async fn plan(
+        &self,
+        _graph: Rc<DistributionGraph>,
+        _scheduler_tick: usize,
+        _planning_context: Option<PlanningContext>,
+    ) -> Option<Rc<LabelledDistributionGraph>> {
+        Some(self.fixed_graph.clone())
+    }
+}
+
+pub struct CentralisedSchedulerPlanner {
+    pub var_names: Vec<VarName>,
+    pub central_node: NodeName,
+}
+
+#[async_trait(?Send)]
+impl SchedulerPlanner for CentralisedSchedulerPlanner {
+    async fn plan(
+        &self,
+        graph: Rc<DistributionGraph>,
+        _scheduler_tick: usize,
+        _planning_context: Option<PlanningContext>,
+    ) -> Option<Rc<LabelledDistributionGraph>> {
+        let labels = graph
+            .graph
+            .node_indices()
+            .map(|i| {
+                let node = graph.graph.node_weight(i).unwrap();
+                (
+                    i,
+                    if *node == self.central_node {
+                        self.var_names.clone()
+                    } else {
+                        vec![]
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let labelled_graph = Rc::new(LabelledDistributionGraph {
+            dist_graph: graph,
+            var_names: self.var_names.clone(),
+            node_labels: labels,
+        });
+        info!("Labelled graph: {:?}", labelled_graph);
+
+        graph_to_png(labelled_graph.clone(), "distributed_graph.png")
+            .await
+            .unwrap();
+        Some(labelled_graph)
+    }
+}

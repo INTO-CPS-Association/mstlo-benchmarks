@@ -1,0 +1,17 @@
+// Notation follows "Using temporal logic to specify adaptive program semantics" paper
+// Use input file "altl_dup.input"
+in x
+in T
+out R
+out c
+out S
+out v
+// Guided adaptation:
+// Old spec is just S = x
+S = x
+// Adaptation condition is "x == 3"
+c = x == 3
+// R is Rcond
+R = when(T) && (c || default(R[1], false)) // Eventually, after T was not Deferred
+// When we haven't received a new spec T, and R is not true, yield from old spec
+v = if R then defer(T) else S

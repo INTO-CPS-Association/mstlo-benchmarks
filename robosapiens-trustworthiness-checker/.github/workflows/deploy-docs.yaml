@@ -1,0 +1,98 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yaml"
+  workflow_run:
+    workflows: ["Rust only workflow"]
+    types: [completed]
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout benchmark history
+        uses: actions/checkout@v4
+        with:
+          ref: benchmark-data
+          path: .benchmark-data
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install mdBook
+        run: |
+          cargo install mdbook --version ^0.4
+
+      - name: Build documentation
+        run: |
+          cd docs
+          mdbook build
+
+      - name: Prepare GitHub Pages site
+        run: |
+          rm -rf .pages-site
+          mkdir -p .pages-site
+          cp -a docs/book/. .pages-site/
+
+          if [ -d .benchmark-data/benchmarks ]; then
+            cp -a .benchmark-data/benchmarks .pages-site/benchmarks
+          fi
+
+          # Presentation is version-controlled on main. The benchmark-data branch
+          # contains the measurements and remains independent of the dashboard UI.
+          mkdir -p .pages-site/benchmarks
+          cp -a docs/benchmark-dashboard/. .pages-site/benchmarks/
+
+          # Fingerprinted asset names prevent a browser or CDN from reusing files
+          # from an earlier documentation or benchmark-history deployment.
+          site_version="$(git rev-parse HEAD)"
+          benchmark_version="$(git -C .benchmark-data rev-parse HEAD)"
+          cp .pages-site/benchmarks/dashboard.css \
+            ".pages-site/benchmarks/dashboard.${site_version}.css"
+          cp .pages-site/benchmarks/dashboard.js \
+            ".pages-site/benchmarks/dashboard.${site_version}.js"
+          cp .pages-site/benchmarks/data.js \
+            ".pages-site/benchmarks/data.${benchmark_version}.js"
+          sed -i \
+            -e "s|dashboard.css|dashboard.${site_version}.css|g" \
+            -e "s|dashboard.js|dashboard.${site_version}.js|g" \
+            -e "s|data.js|data.${benchmark_version}.js|g" \
+            .pages-site/benchmarks/index.html \
+            .pages-site/benchmarks/all.html
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .pages-site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

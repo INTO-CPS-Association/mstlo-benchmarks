@@ -1,0 +1,778 @@
+//! Stream-driven runtime adapter for the synchronous dataflow monitor.
+//!
+//! # What the runtime is
+//!
+//! [`crate::dataflow::DataflowMonitor`] is the interpreter proper. It is a compiled, stateful
+//! synchronous machine: one call to [`DataflowMonitor::evaluate`] consumes one complete logical
+//! input row and immediately produces one complete output row. It does not own an input source,
+//! create output streams, buffer results, or drive itself asynchronously.
+//!
+//! [`DataflowRuntime`] supplies that application-facing machinery. It owns:
+//!
+//! | component | role |
+//! |:----------|:-----|
+//! | [`InputStream<Value>`] | Asynchronously supplies transport batches containing one or more logical ticks. |
+//! | [`DataflowMonitor`] | Compiles and evaluates the specification, retaining all language state between ticks. |
+//! | `DataflowEngine` | Privately converts input ticks into monitor rows and transposes output rows into per-variable buffers. |
+//! | [`OutputHandler`] | Receives one named [`OutputStream`] for each declared output and drives the external sinks. |
+//! | [`ExecutionPolicy`] | Selects when accumulated output values cross the channel boundary. |
+//!
+//! The runtime is therefore an adapter around the monitor, not a second interpreter. Input
+//! batching, channel buffering, and asynchronous sink delivery may change transport granularity and
+//! backpressure, but they do not add logical ticks or alter monitor semantics. See
+//! [`crate::dataflow`] for compilation, scheduling, temporal state, dynamic expressions, and
+//! type specialization.
+//!
+//! ## Construction
+//!
+//! [`DataflowRuntimeBuilder<S>`] accepts any model type for which `DataflowMonitor: TryFrom<S>`.
+//! Passing a [`crate::DsrvSpecification`] selects untyped dataflow compilation; passing a
+//! [`crate::CheckedDsrvSpecification`] selects the checked path and enables type-directed scalar
+//! specialization. The builder also requires an input stream and output handler. `build` stores the
+//! compilation result in the runtime, so a compilation failure is returned when [`Runtime::run`]
+//! begins.
+//!
+//! The builder's executor setting is intentionally unused: this runtime does not spawn a separate
+//! interpreter worker. `run` cooperatively polls the dataflow engine and output-handler futures in
+//! the caller's local executor. [`DataflowRuntimeBuilder::execution_policy`] chooses buffering
+//! behavior. [`DataflowRuntimeBuilder::controlled_input`] wraps an input stream with an
+//! [`crate::io::InputController`] and selects synchronous flushing so control acknowledgements align
+//! with processed logical ticks.
+//!
+//! # End-to-end flow
+//!
+//! When `run` starts, the runtime obtains the monitor's output-variable order and creates one bounded
+//! channel per output. The receiving side of each channel is flattened into an individual-value
+//! `OutputStream<Value>`, and the resulting name-to-stream map is passed to
+//! [`OutputHandler::provide_streams`]. The output handler and the private engine then run
+//! concurrently in the same asynchronous task.
+//!
+//! The engine performs this loop:
+//!
+//! 1. Await the next [`crate::core::InputBatch`].
+//! 2. Visit its logical ticks in order.
+//! 3. Write the tick's values into a reusable monitor input row, leaving omitted inputs as
+//!    [`Value::NoVal`].
+//! 4. Call `DataflowMonitor::evaluate` exactly once.
+//! 5. Reset the supplied input slots to `NoVal`.
+//! 6. Append each successful output-row value to the buffer for its declared output.
+//! 7. Flush according to the selected execution policy.
+//!
+//! The input-row and output-row allocations are reused across ticks. Variable layouts are cached as
+//! input-slot indices, so repeated event shapes do not repeat name lookup. Undeclared input names
+//! are runtime errors. `InputBatch::events` represents each event as its own logical tick;
+//! `InputBatch::step` represents its events as one simultaneous tick; internal fixed-width batches
+//! preserve the same row boundaries.
+//!
+//! # Output buffering and asynchronous delivery
+//!
+//! The monitor returns rows, but the public output interface exposes one stream per declared output.
+//! `DataflowEngine` performs that transpose: after each successful tick, output column `i` is
+//! appended to buffer `i`. A flush sends each `Vec<Value>` through the corresponding channel, and
+//! the receiver flattens successive vectors back into an ordered stream of individual values.
+//!
+//! This batching is invisible at the logical interface. Every successful monitor evaluation
+//! contributes exactly one value to every output stream in the monitor's output order. A failed
+//! evaluation contributes none.
+//!
+//! ## Flush policies
+//!
+//! | policy | when buffers flush | intended effect |
+//! |:-------|:-------------------|:----------------|
+//! | [`ExecutionPolicy::Buffered`] (default) | After 256 logical ticks, plus a final non-empty partial batch at input EOF. | Amortize channel and output-handler overhead across many values. |
+//! | [`ExecutionPolicy::Synchronous`] | After every logical tick. | Put that tick's output batches into the bounded channels before polling the next input tick. |
+//!
+//! Synchronous policy establishes a boundary at the channels, not at the external sink. The output
+//! handler still runs asynchronously, so a successful send does not mean the sink has already
+//! persisted or consumed the value.
+//!
+//! ## Backpressure
+//!
+//! Each output channel holds at most 1024 **batches**, not 1024 individual values. A flush awaits
+//! capacity one output at a time. A sufficiently slow output handler therefore fills a channel,
+//! suspends the engine, and eventually stops further input polling. The monitor itself remains a
+//! synchronous row evaluator; backpressure belongs entirely to this adapter.
+//!
+//! ## Completion, shutdown, and errors
+//!
+//! The engine and output handler are raced:
+//!
+//! - A stored compilation error is returned before channels are created or the output handler starts.
+//! - If the output handler finishes first, its result is returned and the engine is dropped.
+//! - If the engine fails, its input-stream, undeclared-variable, or monitor error is returned and
+//!   the output-handler future is dropped.
+//! - If the engine reaches input EOF normally, it attempts one final partial flush, drops its channel
+//!   senders, and waits for the output handler to drain and finish.
+//! - If an output receiver closes during a normal flush, the engine treats that as successful early
+//!   termination.
+//!
+//! Values accumulated since the previous completed flush may be lost on an error. EOF does not
+//! synthesize extra ticks, so delayed monitor values are not drained after the final input row.
+
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use async_trait::async_trait;
+use futures::future::LocalBoxFuture;
+use futures::pin_mut;
+use futures::{FutureExt, StreamExt, select};
+use smol::LocalExecutor;
+use unsync::spsc;
+
+use crate::core::{ExecutionPolicy, InputStream, OutputHandler, OutputStream, Runtime, Value};
+use crate::dataflow::{DataflowCompilationError, DataflowMonitor};
+use crate::runtime::builder::RuntimeBuilder;
+use crate::stream_utils::channel_to_output_stream;
+
+const DATAFLOW_RUNTIME_BATCH_SIZE: usize = 256;
+const DATAFLOW_OUTPUT_BATCH_CHANNEL_SIZE: usize = 1024;
+
+/// Owns and asynchronously drives one compiled dataflow monitor.
+pub struct DataflowRuntime {
+    input_stream: InputStream<Value>,
+    output_handler: Box<dyn OutputHandler<Val = Value>>,
+    monitor: Result<DataflowMonitor, DataflowCompilationError>,
+    execution_policy: ExecutionPolicy,
+}
+
+/// Configures the model, input stream, output handler, and flush policy for a
+/// [`DataflowRuntime`].
+pub struct DataflowRuntimeBuilder<S>
+where
+    S: 'static,
+    DataflowMonitor: TryFrom<S, Error = DataflowCompilationError>,
+{
+    model: Option<S>,
+    input: Option<InputStream<Value>>,
+    output: Option<Box<dyn OutputHandler<Val = Value>>>,
+    execution_policy: ExecutionPolicy,
+}
+
+impl<S> DataflowRuntimeBuilder<S>
+where
+    S: 'static,
+    DataflowMonitor: TryFrom<S, Error = DataflowCompilationError>,
+{
+    /// Select when completed monitor rows are flushed to output channels.
+    pub fn execution_policy(self, execution_policy: ExecutionPolicy) -> Self {
+        Self {
+            execution_policy,
+            ..self
+        }
+    }
+
+    /// Wrap an input stream with tick control and select synchronous output flushing.
+    ///
+    /// The returned controller acknowledges progress at the runtime's logical-tick
+    /// boundary; output sinks may still consume their channels asynchronously.
+    pub fn controlled_input(self, input: InputStream<Value>) -> (Self, crate::io::InputController) {
+        let (input, controller) = crate::io::controlled(input);
+        (
+            self.execution_policy(ExecutionPolicy::Synchronous)
+                .input(input),
+            controller,
+        )
+    }
+}
+
+impl<S> RuntimeBuilder<S, Value> for DataflowRuntimeBuilder<S>
+where
+    S: 'static,
+    DataflowMonitor: TryFrom<S, Error = DataflowCompilationError>,
+{
+    type Runtime = DataflowRuntime;
+
+    fn new() -> Self {
+        Self {
+            model: None,
+            input: None,
+            output: None,
+            execution_policy: ExecutionPolicy::Buffered,
+        }
+    }
+
+    fn executor(self, _executor: Rc<LocalExecutor<'static>>) -> Self {
+        self
+    }
+
+    fn model(self, model: S) -> Self {
+        Self {
+            model: Some(model),
+            ..self
+        }
+    }
+
+    fn input(self, input: InputStream<Value>) -> Self {
+        Self {
+            input: Some(input),
+            ..self
+        }
+    }
+
+    fn output(self, output: Box<dyn OutputHandler<Val = Value>>) -> Self {
+        Self {
+            output: Some(output),
+            ..self
+        }
+    }
+
+    fn build(self) -> LocalBoxFuture<'static, Self::Runtime> {
+        Box::pin(async move {
+            let model = self.model.expect("Model not supplied");
+            let monitor = DataflowMonitor::try_from(model);
+            DataflowRuntime {
+                input_stream: self.input.expect("Input stream not supplied"),
+                output_handler: self.output.expect("Output handler not supplied"),
+                monitor,
+                execution_policy: self.execution_policy,
+            }
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl Runtime for DataflowRuntime {
+    async fn run_boxed(mut self: Box<Self>) -> anyhow::Result<()> {
+        let monitor = self.monitor?;
+        let output_vars = monitor.output_vars().to_vec();
+        let mut output_senders = Vec::with_capacity(output_vars.len());
+        let output_streams = output_vars
+            .iter()
+            .map(|var| {
+                let (sender, receiver) = spsc::channel(DATAFLOW_OUTPUT_BATCH_CHANNEL_SIZE);
+                output_senders.push(sender);
+                let batches = channel_to_output_stream(receiver);
+                (
+                    var.clone(),
+                    Box::pin(batches.flat_map(futures::stream::iter)) as OutputStream<Value>,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        self.output_handler.provide_streams(output_streams);
+        let output_fut = self.output_handler.run().fuse();
+        let engine_fut = run_dataflow_engine(
+            self.input_stream,
+            monitor,
+            output_senders,
+            self.execution_policy,
+        )
+        .fuse();
+        pin_mut!(output_fut, engine_fut);
+
+        select! {
+            output = output_fut => output,
+            engine = engine_fut => {
+                engine?;
+                output_fut.await
+            },
+        }
+    }
+}
+
+async fn run_dataflow_engine(
+    mut input_stream: InputStream<Value>,
+    monitor: DataflowMonitor,
+    output_senders: Vec<spsc::Sender<Vec<Value>>>,
+    execution_policy: ExecutionPolicy,
+) -> anyhow::Result<()> {
+    let mut engine = DataflowEngine::new(monitor, output_senders);
+    let mut pending = 0;
+
+    while let Some(batch) = input_stream.next().await {
+        let batch = batch?;
+        if let Some((layout, values)) = batch.packed_rows() {
+            engine.select_packed_layout(layout)?;
+            for row in values.chunks(layout.len()) {
+                engine.evaluate_packed_row(row)?;
+                pending += 1;
+                let flush = execution_policy == ExecutionPolicy::Synchronous
+                    || pending == DATAFLOW_RUNTIME_BATCH_SIZE;
+                if flush {
+                    if !engine.flush().await {
+                        return Ok(());
+                    }
+                    pending = 0;
+                }
+            }
+            continue;
+        }
+        for tick in batch.ticks() {
+            engine.evaluate_tick(&tick)?;
+            pending += 1;
+            let flush = execution_policy == ExecutionPolicy::Synchronous
+                || pending == DATAFLOW_RUNTIME_BATCH_SIZE;
+            if flush {
+                if !engine.flush().await {
+                    return Ok(());
+                }
+                pending = 0;
+            }
+        }
+    }
+
+    if pending != 0 {
+        let _ = engine.flush().await;
+    }
+
+    Ok(())
+}
+
+struct DataflowEngine {
+    monitor: DataflowMonitor,
+    output_senders: Vec<spsc::Sender<Vec<Value>>>,
+    output_batches: Vec<Vec<Value>>,
+    input_row: Vec<Value>,
+    output_row: Vec<Value>,
+    input_ids: BTreeMap<crate::VarName, usize>,
+    cached_layout_vars: Vec<crate::VarName>,
+    cached_layout_slots: Vec<usize>,
+}
+
+impl DataflowEngine {
+    fn new(monitor: DataflowMonitor, output_senders: Vec<spsc::Sender<Vec<Value>>>) -> Self {
+        let output_batches = output_senders
+            .iter()
+            .map(|_| Vec::with_capacity(DATAFLOW_RUNTIME_BATCH_SIZE))
+            .collect();
+        let input_row = vec![Value::NoVal; monitor.input_vars().len()];
+        let output_row = vec![Value::NoVal; output_senders.len()];
+        let input_ids: BTreeMap<crate::VarName, usize> = monitor
+            .input_vars()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, var)| (var, index))
+            .collect();
+        Self {
+            monitor,
+            output_senders,
+            output_batches,
+            input_row,
+            output_row,
+            cached_layout_vars: Vec::with_capacity(input_ids.len()),
+            cached_layout_slots: Vec::with_capacity(input_ids.len()),
+            input_ids,
+        }
+    }
+
+    fn evaluate_tick(&mut self, tick: &crate::core::InputTick<'_, Value>) -> anyhow::Result<()> {
+        let layout_matches = tick.len() == self.cached_layout_vars.len()
+            && tick
+                .iter()
+                .zip(&self.cached_layout_vars)
+                .all(|(event, var)| event.var == var);
+        if !layout_matches {
+            self.cached_layout_vars.clear();
+            self.cached_layout_slots.clear();
+            for event in tick.iter() {
+                let Some(&slot) = self.input_ids.get(event.var) else {
+                    return Err(anyhow::anyhow!(
+                        "input stream emitted undeclared dataflow variable `{}`",
+                        event.var
+                    ));
+                };
+                self.cached_layout_vars.push(event.var.clone());
+                self.cached_layout_slots.push(slot);
+            }
+        }
+
+        for (event, &slot) in tick.iter().zip(&self.cached_layout_slots) {
+            self.input_row[slot] = event.value.clone();
+        }
+
+        let result = self.monitor.evaluate(&self.input_row, &mut self.output_row);
+        for &slot in &self.cached_layout_slots {
+            self.input_row[slot] = Value::NoVal;
+        }
+        result?;
+        self.push_outputs();
+        Ok(())
+    }
+
+    fn select_packed_layout(&mut self, layout: &[crate::VarName]) -> anyhow::Result<()> {
+        if layout == self.cached_layout_vars {
+            return Ok(());
+        }
+        self.cached_layout_vars.clear();
+        self.cached_layout_slots.clear();
+        for var in layout {
+            let Some(&slot) = self.input_ids.get(var) else {
+                return Err(anyhow::anyhow!(
+                    "input stream emitted undeclared dataflow variable `{var}`"
+                ));
+            };
+            self.cached_layout_vars.push(var.clone());
+            self.cached_layout_slots.push(slot);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn evaluate_packed_row(&mut self, values: &[Value]) -> anyhow::Result<()> {
+        debug_assert_eq!(values.len(), self.cached_layout_slots.len());
+        for (value, &slot) in values.iter().zip(&self.cached_layout_slots) {
+            self.input_row[slot] = value.clone();
+        }
+
+        let result = self.monitor.evaluate(&self.input_row, &mut self.output_row);
+        for &slot in &self.cached_layout_slots {
+            self.input_row[slot] = Value::NoVal;
+        }
+        result?;
+        self.push_outputs();
+        Ok(())
+    }
+
+    fn push_outputs(&mut self) {
+        for (batch, value) in self.output_batches.iter_mut().zip(&self.output_row) {
+            batch.push(value.clone());
+        }
+    }
+
+    async fn flush(&mut self) -> bool {
+        for (sender, batch) in self.output_senders.iter_mut().zip(&mut self.output_batches) {
+            if sender.send(std::mem::take(batch)).await.is_err() {
+                return false;
+            }
+            *batch = Vec::with_capacity(DATAFLOW_RUNTIME_BATCH_SIZE);
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    use macro_rules_attribute::apply;
+    use smol::LocalExecutor;
+
+    use crate::VarName;
+    use crate::io::map;
+    use crate::io::testing::LimitedNullOutputHandler;
+    use crate::io::testing::ManualOutputHandler;
+    use crate::{CheckedDsrvSpecification, DsrvSpecification, TypeCheckOptions, Value, async_test};
+
+    use super::*;
+
+    async fn run_dataflow_runtime(
+        executor: Rc<LocalExecutor<'static>>,
+        spec_src: &'static str,
+        inputs: BTreeMap<VarName, Vec<Value>>,
+        limit: usize,
+    ) {
+        let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+        let output_handler = Box::new(LimitedNullOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+            limit,
+        ));
+        let runtime = DataflowRuntimeBuilder::<DsrvSpecification>::new()
+            .executor(executor.clone())
+            .model(spec)
+            .input(map::input_stream(inputs))
+            .output(output_handler)
+            .build()
+            .await;
+
+        runtime.run().await.expect("dataflow runtime should run");
+    }
+
+    #[apply(async_test)]
+    async fn dataflow_runtime_evaluates_simple_arithmetic(executor: Rc<LocalExecutor<'static>>) {
+        run_dataflow_runtime(
+            executor,
+            "in x\nin y\nout z\nz = x + y",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![Value::Int(10), Value::Int(20), Value::Int(30)],
+                ),
+            ]),
+            3,
+        )
+        .await;
+    }
+
+    #[apply(async_test)]
+    async fn dataflow_synchronous_controller_acknowledges_processed_ticks(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x\nout z\nz = x + 1";
+        let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+        let mut output_handler = Box::new(ManualOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+        ));
+        let mut outputs = output_handler.get_output();
+        let input = map::input_stream(BTreeMap::from([(
+            VarName::new("x"),
+            vec![Value::Int(1), Value::Int(2)],
+        )]));
+        let (builder, controller) = DataflowRuntimeBuilder::<DsrvSpecification>::new()
+            .executor(executor)
+            .model(spec)
+            .controlled_input(input);
+        let runtime = builder.output(output_handler).build().await;
+
+        let control = async move {
+            controller.advance().await.unwrap();
+            let first = outputs.next().await.unwrap();
+            assert_eq!(first.get(&VarName::new("z")), Some(&Value::Int(2)));
+            controller.advance().await.unwrap();
+            let second = outputs.next().await.unwrap();
+            assert_eq!(second.get(&VarName::new("z")), Some(&Value::Int(3)));
+        };
+        let (result, ()) = futures::join!(runtime.run(), control);
+        result.unwrap();
+    }
+    #[apply(async_test)]
+    async fn dataflow_runtime_evaluates_recursive_accumulator(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        run_dataflow_runtime(
+            executor,
+            "in x\nout z\nz = default(z[1], 0) + x",
+            BTreeMap::from([(
+                VarName::new("x"),
+                vec![
+                    Value::Int(1),
+                    Value::Int(2),
+                    Value::Int(3),
+                    Value::Int(4),
+                    Value::Int(5),
+                ],
+            )]),
+            5,
+        )
+        .await;
+    }
+
+    #[apply(async_test)]
+    async fn typed_dataflow_runtime_evaluates_simple_arithmetic(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x: Int\nin y: Int\nout z: Int\nz = x + y";
+        let spec = spec_src.parse::<CheckedDsrvSpecification>().unwrap();
+        let output_handler = Box::new(LimitedNullOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+            3,
+        ));
+        let runtime =
+            DataflowRuntimeBuilder::<crate::lang::dsrv::ast::CheckedDsrvSpecification>::new()
+                .executor(executor.clone())
+                .model(spec)
+                .input(map::input_stream(BTreeMap::from([
+                    (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+                    (VarName::new("y"), vec![10.into(), 20.into(), 30.into()]),
+                ])))
+                .output(output_handler)
+                .build()
+                .await;
+
+        runtime
+            .run()
+            .await
+            .expect("typed dataflow runtime should run");
+    }
+
+    #[apply(async_test)]
+    async fn gradual_typed_dataflow_runtime_uses_value_fallback(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x: Any\nin y: Any\nout z: Any\nz = x + y";
+        let spec =
+            CheckedDsrvSpecification::parse_with(spec_src, TypeCheckOptions::GRADUAL).unwrap();
+        let output_handler = Box::new(LimitedNullOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+            3,
+        ));
+        let runtime =
+            DataflowRuntimeBuilder::<crate::lang::dsrv::ast::CheckedDsrvSpecification>::new()
+                .executor(executor.clone())
+                .model(spec)
+                .input(map::input_stream(BTreeMap::from([
+                    (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+                    (VarName::new("y"), vec![10.into(), 20.into(), 30.into()]),
+                ])))
+                .output(output_handler)
+                .build()
+                .await;
+
+        runtime
+            .run()
+            .await
+            .expect("gradual typed dataflow runtime should run");
+    }
+
+    #[apply(async_test)]
+    async fn gradual_typed_dataflow_runtime_casts_untyped_input(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x\nout z\nz = x + 1";
+        let spec =
+            CheckedDsrvSpecification::parse_with(spec_src, TypeCheckOptions::GRADUAL).unwrap();
+        let mut output_handler = Box::new(ManualOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+        ));
+        let outputs = output_handler.get_output();
+        let runtime =
+            DataflowRuntimeBuilder::<crate::lang::dsrv::ast::CheckedDsrvSpecification>::new()
+                .executor(executor.clone())
+                .model(spec)
+                .input(map::input_stream(BTreeMap::from([(
+                    VarName::new("x"),
+                    vec![41.into(), 1.into()],
+                )])))
+                .output(output_handler)
+                .build()
+                .await;
+
+        executor.spawn(runtime.run()).detach();
+        let outputs = tc_testutils::streams::with_timeout(
+            outputs.collect::<Vec<_>>(),
+            5,
+            "gradual typed dataflow cast output collection",
+        )
+        .await
+        .expect("dataflow cast output collection should finish");
+
+        assert_eq!(
+            outputs,
+            vec![
+                BTreeMap::from([(VarName::new("z"), Value::Int(42))]),
+                BTreeMap::from([(VarName::new("z"), Value::Int(2))]),
+            ]
+        );
+    }
+
+    #[apply(async_test)]
+    async fn dataflow_runtime_drains_outputs_after_input_finishes(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x\nout z\nz = x + 10";
+        let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+        let mut output_handler = Box::new(ManualOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+        ));
+        let outputs = output_handler.get_output();
+        let runtime = DataflowRuntimeBuilder::<DsrvSpecification>::new()
+            .executor(executor.clone())
+            .model(spec)
+            .input(map::input_stream(BTreeMap::from([(
+                VarName::new("x"),
+                vec![Value::Int(1), Value::Int(2)],
+            )])))
+            .output(output_handler)
+            .build()
+            .await;
+
+        executor.spawn(runtime.run()).detach();
+        let outputs = tc_testutils::streams::with_timeout(
+            outputs.collect::<Vec<_>>(),
+            5,
+            "dataflow manual output collection",
+        )
+        .await
+        .expect("dataflow output collection should finish");
+
+        assert_eq!(
+            outputs,
+            vec![
+                BTreeMap::from([(VarName::new("z"), Value::Int(11))]),
+                BTreeMap::from([(VarName::new("z"), Value::Int(12))]),
+            ]
+        );
+    }
+
+    #[apply(async_test)]
+    async fn dataflow_runtime_flushes_full_and_partial_internal_batches(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x\nout z\nz = x + 1";
+        let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+        let mut output_handler = Box::new(ManualOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+        ));
+        let outputs = output_handler.get_output();
+        let runtime = DataflowRuntimeBuilder::<DsrvSpecification>::new()
+            .executor(executor.clone())
+            .model(spec)
+            .input(map::input_stream(BTreeMap::from([(
+                VarName::new("x"),
+                (0..300).map(Value::Int).collect(),
+            )])))
+            .output(output_handler)
+            .build()
+            .await;
+
+        executor.spawn(runtime.run()).detach();
+        let outputs = tc_testutils::streams::with_timeout(
+            outputs.collect::<Vec<_>>(),
+            5,
+            "privately batched dataflow output collection",
+        )
+        .await
+        .expect("privately batched output collection should finish");
+
+        assert_eq!(outputs.len(), 300);
+        assert_eq!(outputs[0][&VarName::new("z")], Value::Int(1));
+        assert_eq!(outputs[299][&VarName::new("z")], Value::Int(300));
+    }
+
+    #[apply(async_test)]
+    async fn dataflow_runtime_preserves_logical_ticks_inside_transport_batches(
+        executor: Rc<LocalExecutor<'static>>,
+    ) {
+        let spec_src = "in x\nin y\nout z\nz = 42";
+        let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+        let mut output_handler = Box::new(ManualOutputHandler::new(
+            executor.clone(),
+            spec.output_vars().clone(),
+        ));
+        let outputs = output_handler.get_output();
+        let simultaneous = crate::InputBatch::step(vec![
+            crate::InputEvent::new("x".into(), Value::Int(1)),
+            crate::InputEvent::new("y".into(), Value::Int(10)),
+        ]);
+        let independent = Ok(crate::InputBatch::events(vec![
+            crate::InputEvent::new("x".into(), Value::Int(2)),
+            crate::InputEvent::new("y".into(), Value::Int(20)),
+        ]));
+        let input = Box::pin(futures::stream::iter([simultaneous, independent]));
+        let runtime = DataflowRuntimeBuilder::<DsrvSpecification>::new()
+            .executor(executor.clone())
+            .model(spec)
+            .input(input)
+            .output(output_handler)
+            .build()
+            .await;
+
+        executor.spawn(runtime.run()).detach();
+        let outputs = tc_testutils::streams::with_timeout(
+            outputs.collect::<Vec<_>>(),
+            5,
+            "dataflow logical tick output collection",
+        )
+        .await
+        .expect("dataflow logical tick output collection should finish");
+
+        assert_eq!(outputs.len(), 3);
+        assert!(
+            outputs
+                .iter()
+                .all(|row| row[&VarName::new("z")] == Value::Int(42))
+        );
+    }
+}

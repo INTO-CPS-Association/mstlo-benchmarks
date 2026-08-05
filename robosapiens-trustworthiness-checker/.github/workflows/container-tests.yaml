@@ -1,0 +1,33 @@
+name: Container tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fix workspace permissions
+        run: sudo chown -R 1000:1000 ${{ github.workspace }}
+
+      - name: Build Docker image
+        run: docker build -t robosapiens-test -f docker/Dockerfile --target dev .
+
+      - name: Run cargo test
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/ws \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /ws \
+            --network host \
+            --privileged \
+            robosapiens-test \
+            bash -c "sudo chmod 666 /var/run/docker.sock && export RUST_LOG=debug && source ~/.cargo/env && cargo test --all-features"

@@ -1,0 +1,179 @@
+[package]
+name = "trustworthiness_checker"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE.md"
+default-run = "trustworthiness_checker"
+exclude = ["examples/*", "scripts/*", "log/*", "benches/*"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace]
+members = [
+    "libs/contiguous-tree",
+    "libs/contiguous-tree-macros",
+    "libs/tc-testutils",
+    "integrations/python",
+]
+
+[lib]
+name = "trustworthiness_checker"
+path = "src/lib.rs"
+crate-type = ["lib"]
+bench = false
+
+[build-dependencies]
+lalrpop = "0.23.1"
+
+[dependencies]
+contiguous-tree = { path = "libs/contiguous-tree", features = ["serde"] }
+winnow = { version = "1.0.3", features = ["simd"] }
+futures = "0.3.32"
+
+clap = { version = "4.6.1", features = ["derive"] }
+async-stream = "0.3.6"
+r2r = { version = "0.9.5", optional = true }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1.0.150"
+serde_json5 = "0.2.1"
+toml = "0.9.8"
+# mqtt client
+# Disable the default dependency on SSL to avoid a build dependency on OpenSSL
+paho-mqtt = { version = "0.14.0", optional = true, default-features = false, features = [
+    "bundled",
+    "ssl",
+] }
+rumqttc = { version = "0.25.1", default-features = false }
+async-trait = "0.1.89"
+tracing = { version = "0.1.44", features = [
+    "attributes",
+    "std",
+    "tracing-attributes",
+    "async-await",
+    "release_max_level_warn",
+] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2.5"
+uuid = { version = "1.23.3", features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+] }
+strum = "0.28.0"
+strum_macros = "0.28.0"
+petgraph = { version = "0.8.3", features = ["serde-1"] }
+enum_inner_method = { git = "https://github.com/mortenhaahr/enum_inner_method", tag = "v0.1.0" }
+smol = "2.0.2"
+async-unsync = "0.3.0"
+smol-macros = "0.1.1"
+macro_rules_attribute = "0.2.2"
+async-compat = "0.2.5"
+tikv-jemallocator = { version = "0.6.1", optional = true }
+ecow = { version = "0.3.0", features = ["serde"] }
+async_cell = "0.2.3"
+async-channel = "2.5.0"
+ordered-float = "5.3.0"
+approx = "0.5.1"
+lalrpop-util = { version = "0.23.1", features = ["lexer", "unicode"] }
+contracts = "0.6.7"
+static_assertions = "1.1.0"
+thiserror = "2.0.18"
+rand = "0.10.1"
+unsync = "0.2.0"
+itertools = "0.15.0"
+sat-solver = { version = "0.2.1", optional = true }
+redis = { version = "1.2.3", default-features = false, features = ["smol-comp"] }
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+fs2 = "0.4.3"
+event-listener = "5.4.1"
+mstlo = "0.1.1"
+
+[profile.dev-fast]
+# Optimize build times for debug builds
+# Note that this affects the information carried in the debug symbols,
+# notably for RUST_BACKTRACE=1
+inherits = "dev"
+debug = 0
+strip = "debuginfo"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.bench-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[features]
+default = ["jemalloc", "mqtt", "sat"]
+jemalloc = ["dep:tikv-jemallocator"]
+mqtt = ["dep:paho-mqtt"]
+sat = ["dep:sat-solver"]
+ros = ["dep:r2r", "tc-testutils/ros", "mqtt"]
+testcontainers = ["tc-testutils/testcontainers"]
+span-tracing = []
+extended-proptests = []
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_smol", "html_reports"] }
+test-log = { version = "0.2.21", features = ["trace"] }
+proptest = "1.11.0"
+tc-testutils = { path = "libs/tc-testutils" }
+
+[[bench]]
+name = "simple_add"
+harness = false
+
+[[bench]]
+name = "dataflow_semantics"
+harness = false
+
+[[bench]]
+name = "maple_sequence"
+harness = false
+
+[[bench]]
+name = "dup_defer"
+harness = false
+
+[[bench]]
+name = "dyn_paper"
+harness = false
+
+[[bench]]
+name = "dsrv_paper"
+harness = false
+
+[[bench]]
+name = "parsing"
+harness = false
+
+[[bench]]
+name = "compilation_phases"
+harness = false
+
+
+[[bench]]
+name = "time_dependent_property"
+harness = false
+
+[[bench]]
+name = "dataflow_runtime"
+harness = false
+
+[[bench]]
+name = "dataflow_allocations"
+harness = false
+
+[[bench]]
+name = "threshold_property"
+harness = false
+
+[[bench]]
+name = "arithmetic_heavy"
+harness = false
+
+# [dev-dependencies.tc-testutils]
+# path = "libs/tc-testutils"

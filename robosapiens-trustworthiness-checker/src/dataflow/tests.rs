@@ -1,0 +1,3553 @@
+use super::*;
+use crate::core::BinaryOperator;
+use crate::dsrv_fixtures::TestConfig;
+use crate::io::map;
+use crate::io::testing::ManualOutputHandler;
+use crate::lang::dsrv::ast::Expr;
+use crate::lang::dsrv::parser::parse_expr as parse_dsrv_expr;
+use crate::lang::dsrv::test_support::{arb_boolean_dsrv_spec, arb_dsrv_spec};
+
+use crate::runtime::asynchronous::{AsyncRuntimeBuilder, Context};
+use crate::runtime::builder::{RuntimeBuilder, SemiSyncValueConfig};
+use crate::runtime::dataflow::DataflowRuntimeBuilder;
+use crate::runtime::semi_sync::SemiSyncRuntimeBuilder;
+use crate::semantics::UntimedDsrvSemantics;
+use crate::{CheckedDsrvSpecification, DsrvSpecification, TypeCheckOptions, async_test};
+use crate::{
+    core::{InputEvent, OutputStream, Runtime},
+    semantics::{MonitoringSemantics, StreamContext},
+};
+use futures::{StreamExt, stream};
+use macro_rules_attribute::apply;
+use proptest::prelude::*;
+use smol::LocalExecutor;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+use tc_testutils::streams::with_timeout;
+
+fn sparse_int() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        6 => any::<i16>().prop_map(|value| Value::Int(i64::from(value))),
+        2 => Just(Value::NoVal),
+        2 => Just(Value::Deferred),
+    ]
+}
+
+fn sparse_bool() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        6 => any::<bool>().prop_map(Value::Bool),
+        2 => Just(Value::NoVal),
+        2 => Just(Value::Deferred),
+    ]
+}
+
+fn arb_valid_dataflow_program_and_inputs()
+-> impl Strategy<Value = (DsrvSpecification, Vec<(Value, Value)>)> {
+    (
+        prop::collection::vec(any::<[u8; 3]>(), 1..16),
+        prop::collection::vec((sparse_int(), sparse_bool()), 1..40),
+    )
+        .prop_map(|(recipes, rows)| {
+            let mut exprs = BTreeMap::<VarName, Expr>::new();
+            let mut annotations = BTreeMap::from([
+                (VarName::new("x"), StreamType::Int),
+                (VarName::new("flag"), StreamType::Bool),
+            ]);
+
+            for (index, [operator, first, second]) in recipes.into_iter().enumerate() {
+                let name = VarName::from(format!("s{index}"));
+                let dependency = |selector: u8| {
+                    let selected = usize::from(selector) % (index + 1);
+                    if selected == 0 {
+                        VarName::new("x")
+                    } else {
+                        VarName::from(format!("s{}", selected - 1))
+                    }
+                };
+                let lhs = dependency(first);
+                let rhs = dependency(second);
+                let offset = u64::from(second % 5);
+                let var = |name: VarName| Expr::Var(name);
+                let expression = match operator % 12 {
+                    0 => Expr::BinOp(Box::new(var(lhs)), Box::new(var(rhs)), BinaryOperator::Add),
+                    1 => Expr::If(
+                        Box::new(var(VarName::new("flag"))),
+                        Box::new(var(lhs)),
+                        Box::new(var(rhs)),
+                    ),
+                    2 => Expr::SIndex(Box::new(var(lhs)), offset),
+                    3 => Expr::Default(
+                        Box::new(Expr::SIndex(Box::new(var(lhs)), offset)),
+                        Box::new(var(VarName::new("x"))),
+                    ),
+                    4 => Expr::Update(Box::new(var(lhs)), Box::new(var(rhs))),
+                    5 => Expr::Init(Box::new(var(lhs)), Box::new(var(rhs))),
+                    6 => Expr::BinOp(
+                        Box::new(Expr::Default(
+                            Box::new(Expr::SIndex(
+                                Box::new(var(name.clone())),
+                                u64::from(second % 4) + 1,
+                            )),
+                            Box::new(Expr::Val(Value::Int(0))),
+                        )),
+                        Box::new(var(VarName::new("x"))),
+                        BinaryOperator::Add,
+                    ),
+                    7 => Expr::Abs(Box::new(var(lhs))),
+                    8 => Expr::Latch(Box::new(var(lhs)), Box::new(var(rhs))),
+                    9 => Expr::BinOp(
+                        Box::new(var(lhs)),
+                        Box::new(var(rhs)),
+                        BinaryOperator::Subtract,
+                    ),
+                    10 => Expr::Default(Box::new(var(lhs)), Box::new(var(rhs))),
+                    _ => Expr::Val(Value::Int(i64::from(first))),
+                };
+                exprs.insert(name.clone(), expression.into());
+                annotations.insert(name, StreamType::Int);
+            }
+
+            // Guarantee that every generated case executes both the direct single-scalar path and
+            // scalar publication between streams. The remaining recipes exercise mixed canonical
+            // and specialized graphs.
+            let specialized_unary = VarName::new("specialized_unary");
+            exprs.insert(
+                specialized_unary.clone(),
+                Expr::Abs(Box::new(Expr::Var(VarName::new("x")))).into(),
+            );
+            annotations.insert(specialized_unary.clone(), StreamType::Int);
+            let specialized_binary = VarName::new("specialized_binary");
+            exprs.insert(
+                specialized_binary.clone(),
+                Expr::BinOp(
+                    Box::new(Expr::Var(specialized_unary)),
+                    Box::new(Expr::Var(VarName::new("x"))),
+                    BinaryOperator::Add,
+                )
+                .into(),
+            );
+            annotations.insert(specialized_binary, StreamType::Int);
+
+            let stream_vars = exprs.keys().cloned().collect::<BTreeSet<_>>();
+            let spec = DsrvSpecification::new(
+                BTreeSet::from([VarName::new("x"), VarName::new("flag")]),
+                stream_vars,
+                exprs,
+                annotations,
+                Vec::new(),
+            );
+            (spec, rows)
+        })
+}
+
+fn arb_specialized_runtime_program_and_inputs()
+-> impl Strategy<Value = (DsrvSpecification, Vec<(Value, Value)>)> {
+    (
+        prop::collection::vec(any::<[u8; 3]>(), 1..16),
+        prop::collection::vec((sparse_int(), sparse_bool()), 1..40),
+    )
+        .prop_map(|(recipes, rows)| {
+            let x = VarName::new("x");
+            let flag = VarName::new("flag");
+            let unary = VarName::new("unary");
+            let binary = VarName::new("binary");
+            let mut exprs = BTreeMap::from([
+                (
+                    unary.clone(),
+                    Expr::Abs(Box::new(Expr::Var(x.clone()))).into(),
+                ),
+                (
+                    binary.clone(),
+                    Expr::BinOp(
+                        Box::new(Expr::Var(unary.clone())),
+                        Box::new(Expr::Var(x.clone())),
+                        BinaryOperator::Add,
+                    )
+                    .into(),
+                ),
+            ]);
+            let mut annotations = BTreeMap::from([
+                (x.clone(), StreamType::Int),
+                (flag.clone(), StreamType::Bool),
+                (unary, StreamType::Int),
+                (binary, StreamType::Int),
+            ]);
+            let mut available = vec![x.clone()];
+
+            for (index, [operator, first, second]) in recipes.into_iter().enumerate() {
+                let name = VarName::from(format!("generated_{index}"));
+                let lhs = available[usize::from(first) % available.len()].clone();
+                let rhs = available[usize::from(second) % available.len()].clone();
+                let expression = match operator % 4 {
+                    0 => Expr::BinOp(
+                        Box::new(Expr::Var(lhs)),
+                        Box::new(Expr::Var(rhs)),
+                        BinaryOperator::Add,
+                    ),
+                    1 => Expr::BinOp(
+                        Box::new(Expr::Var(lhs)),
+                        Box::new(Expr::Var(rhs)),
+                        BinaryOperator::Subtract,
+                    ),
+                    2 => Expr::Abs(Box::new(Expr::Var(lhs))),
+                    _ => Expr::If(
+                        Box::new(Expr::Var(flag.clone())),
+                        Box::new(Expr::Var(lhs)),
+                        Box::new(Expr::Var(rhs)),
+                    ),
+                };
+                exprs.insert(name.clone(), expression.into());
+                annotations.insert(name.clone(), StreamType::Int);
+                available.push(name);
+            }
+
+            let stream_vars = exprs.keys().cloned().collect();
+            (
+                DsrvSpecification::new(
+                    BTreeSet::from([x, flag]),
+                    stream_vars,
+                    exprs,
+                    annotations,
+                    Vec::new(),
+                ),
+                rows,
+            )
+        })
+}
+
+type DynamicInputRow = (Value, Value, Value);
+
+fn arb_runtime_compiled_program(
+    combinator: &'static str,
+) -> impl Strategy<Value = (DsrvSpecification, Vec<DynamicInputRow>)> {
+    prop::collection::vec((sparse_int(), sparse_int(), any::<[u8; 2]>()), 1..40).prop_map(
+        move |rows| {
+            let property = if combinator == "dynamic" {
+                "dynamic(source: Int, {x, y, source, sum})"
+            } else {
+                "defer(source: Int)"
+            };
+            let spec_source = format!(
+                "in x: Int\nin y: Int\nin source: Str\n\
+             out z: Int\naux sum: Int\n\
+             z = {property}\n\
+             sum = x + y"
+            );
+            let spec = spec_source.as_str().parse::<DsrvSpecification>().unwrap();
+            let rows = rows
+                .into_iter()
+                .map(|(x, y, [action, expression])| {
+                    let source = match action % 5 {
+                        0 => Value::NoVal,
+                        1 => Value::Deferred,
+                        _ => {
+                            let offset = expression % 5;
+                            let source = match (combinator, expression % 10) {
+                                ("defer", 2) => "x + y".to_owned(),
+                                ("defer", 5) => format!("default(y[{offset}], x)"),
+                                (_, 0) => "x".to_owned(),
+                                (_, 1) => "y".to_owned(),
+                                (_, 2) => "sum".to_owned(),
+                                (_, 3) => "x + y".to_owned(),
+                                (_, 4) => format!("default(x[{offset}], 0) + y"),
+                                (_, 5) => format!("default(sum[{offset}], x)"),
+                                (_, 6) => "if x > y then x + y else x".to_owned(),
+                                (_, 7) => "latch(x, x > y)".to_owned(),
+                                (_, 8) => "update(x, y)".to_owned(),
+                                _ => "if when(x) then 1 else 0".to_owned(),
+                            };
+                            Value::Str(source.into())
+                        }
+                    };
+                    (x, y, source)
+                })
+                .collect();
+            (spec, rows)
+        },
+    )
+}
+
+fn evaluate_runtime_compiled_property(spec: DsrvSpecification, rows: &[DynamicInputRow]) {
+    let typed_spec = spec
+        .clone()
+        .type_check(TypeCheckOptions::STRICT)
+        .expect("generated specification must type check");
+    let mut monitors = [
+        DataflowMonitor::compile_untyped(spec)
+            .expect("generated untyped specification must compile"),
+        DataflowMonitor::compile_checked(typed_spec)
+            .expect("generated typed specification must compile"),
+    ];
+
+    let mut traces = Vec::new();
+    for monitor in &mut monitors {
+        let mut trace = Vec::new();
+        let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+        for (x, y, source) in rows {
+            let input = monitor
+                .input_vars()
+                .iter()
+                .map(|name| {
+                    if name == &VarName::new("x") {
+                        x.clone()
+                    } else if name == &VarName::new("y") {
+                        y.clone()
+                    } else if name == &VarName::new("source") {
+                        source.clone()
+                    } else {
+                        unreachable!("generator declares only x, y, and source")
+                    }
+                })
+                .collect::<Vec<_>>();
+            let result = monitor.evaluate(&input, &mut output);
+            trace.push((result.map_err(|error| error.to_string()), output.clone()));
+            if trace.last().is_some_and(|(result, _)| result.is_err()) {
+                break;
+            }
+        }
+        traces.push(trace);
+    }
+
+    assert_eq!(traces[0], traces[1]);
+}
+
+const DATAFLOW_PROPTEST_CASES: u32 = if cfg!(feature = "extended-proptests") {
+    10_000
+} else {
+    256
+};
+
+const RUNTIME_EQUIVALENCE_PROPTEST_CASES: u32 = if cfg!(feature = "extended-proptests") {
+    1_000
+} else {
+    64
+};
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(DATAFLOW_PROPTEST_CASES))]
+
+    /// Compilation must terminate without panicking for every generated DSRV AST. Generated
+    /// specifications may be invalid; a structured `DataflowCompilationError` is a valid result.
+    #[test]
+    fn dataflow_compilation_is_total(spec in arb_boolean_dsrv_spec()) {
+        let _ = DataflowMonitor::compile_untyped(spec);
+    }
+
+    #[test]
+    fn untyped_dataflow_compilation_is_total(spec in arb_dsrv_spec()) {
+        let _ = DataflowMonitor::compile_untyped(spec);
+    }
+
+    #[test]
+    fn valid_dataflow_program_evaluation_is_total(
+        (spec, rows) in arb_valid_dataflow_program_and_inputs()
+    ) {
+        let typed_spec = spec.clone().type_check(TypeCheckOptions::STRICT).expect("generator must produce a typed program");
+        let mut augmented_spec = spec.clone();
+        let unused = VarName::new("unused");
+        augmented_spec.aux_vars.insert(unused.clone());
+        augmented_spec.stream_vars.insert(unused.clone());
+        let mut exprs = augmented_spec
+            .exprs
+            .keys()
+            .map(|name| (name.clone(), augmented_spec.exprs.get_owned(name).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        exprs.insert(unused.clone(), Expr::Val(Value::Int(0)).into());
+        augmented_spec.type_annotations.insert(unused, StreamType::Int);
+        augmented_spec = DsrvSpecification::new(
+            augmented_spec.input_vars,
+            augmented_spec.output_vars,
+            exprs,
+            augmented_spec.type_annotations,
+            augmented_spec.aux_vars,
+        );
+        let mut monitors = [
+            DataflowMonitor::compile_untyped(spec.clone())
+                .expect("generator must produce an untyped dataflow plan"),
+            DataflowMonitor::compile_checked(typed_spec)
+                .expect("generator must produce a typed dataflow plan"),
+            DataflowMonitor::compile_untyped(spec)
+                .expect("recompilation must produce an equivalent dataflow plan"),
+            DataflowMonitor::compile_untyped(augmented_spec)
+                .expect("adding an unused stream must preserve a valid dataflow plan"),
+        ];
+
+        let mut traces = Vec::new();
+        for monitor in &mut monitors {
+            let mut correctly_sized_output = vec![Value::NoVal; monitor.output_vars().len()];
+            let input_count_result =
+                monitor.evaluate(&[Value::NoVal], &mut correctly_sized_output);
+            prop_assert!(
+                matches!(input_count_result, Err(DataflowEvaluationError::InputCountMismatch { .. })),
+                "undersized input did not return InputCount"
+            );
+            let mut undersized_output = vec![Value::NoVal; monitor.output_vars().len() - 1];
+            let output_count_result =
+                monitor.evaluate(&[Value::NoVal, Value::NoVal], &mut undersized_output);
+            prop_assert!(
+                matches!(output_count_result, Err(DataflowEvaluationError::OutputCountMismatch { .. })),
+                "undersized output did not return OutputCount"
+            );
+
+            let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+            let mut trace = Vec::new();
+            for (integer, boolean) in &rows {
+                let row = monitor
+                    .input_vars()
+                    .iter()
+                    .map(|name| {
+                        if name == &VarName::new("x") {
+                            integer.clone()
+                        } else if name == &VarName::new("flag") {
+                            boolean.clone()
+                        } else {
+                            unreachable!("generator declares only x and flag")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let result = monitor.evaluate(&row, &mut output);
+                trace.push((result.is_ok(), output.clone()));
+                if result.is_err() {
+                    break;
+                }
+            }
+            traces.push(trace);
+        }
+        prop_assert_eq!(&traces[0], &traces[1]);
+        prop_assert_eq!(&traces[0], &traces[2]);
+        prop_assert_eq!(&traces[0], &traces[3]);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(RUNTIME_EQUIVALENCE_PROPTEST_CASES))]
+
+    #[test]
+    fn specialized_runtime_matches_both_reference_runtimes(
+        (spec, rows) in arb_specialized_runtime_program_and_inputs()
+    ) {
+        let inputs = BTreeMap::from([
+            (
+                VarName::new("x"),
+                rows.iter().map(|(x, _)| x.clone()).collect(),
+            ),
+            (
+                VarName::new("flag"),
+                rows.iter().map(|(_, flag)| flag.clone()).collect(),
+            ),
+        ]);
+        assert_generated_runtime_parity(spec, inputs);
+    }
+
+    #[test]
+    fn dynamic_specialized_runtime_matches_both_reference_runtimes(
+        (spec, rows) in arb_runtime_compiled_program("dynamic")
+    ) {
+        evaluate_runtime_compiled_property(spec.clone(), &rows);
+        assert_generated_runtime_parity(spec, dynamic_inputs(&rows));
+    }
+
+    #[test]
+    fn defer_specialized_runtime_matches_both_reference_runtimes(
+        (spec, rows) in arb_runtime_compiled_program("defer")
+    ) {
+        evaluate_runtime_compiled_property(spec.clone(), &rows);
+        assert_generated_runtime_parity(spec, dynamic_inputs(&rows));
+    }
+}
+
+fn evaluate(monitor: &mut DataflowMonitor, columns: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    let len = columns.first().map_or(0, Vec::len);
+    assert!(columns.iter().all(|column| column.len() == len));
+    let mut output = vec![Vec::new(); monitor.output_vars().len()];
+    let mut input_row = vec![Value::NoVal; columns.len()];
+    let mut output_row = vec![Value::NoVal; output.len()];
+    for tick in 0..len {
+        for (value, column) in input_row.iter_mut().zip(columns) {
+            *value = column[tick].clone();
+        }
+        monitor.evaluate(&input_row, &mut output_row).unwrap();
+        for (column, value) in output.iter_mut().zip(&output_row) {
+            column.push(value.clone());
+        }
+    }
+    output
+}
+
+fn evaluate_events(
+    monitor: &mut DataflowMonitor,
+    events: &[crate::core::InputEvent<Value>],
+) -> Vec<Vec<Value>> {
+    let input_ids = monitor
+        .input_vars()
+        .iter()
+        .enumerate()
+        .map(|(index, var)| (var, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut columns = (0..input_ids.len())
+        .map(|_| vec![Value::NoVal; events.len()])
+        .collect::<Vec<_>>();
+    for (tick, event) in events.iter().enumerate() {
+        columns[input_ids[&event.var]][tick] = event.value.clone();
+    }
+    evaluate(monitor, &columns)
+}
+
+fn parse_expr(src: &str) -> Expr {
+    parse_dsrv_expr(src).expect("expression should parse")
+}
+
+async fn eval_with<S>(
+    executor: Rc<LocalExecutor<'static>>,
+    src: &str,
+    vars: Vec<(&str, Vec<Value>)>,
+) -> Vec<Value>
+where
+    S: MonitoringSemantics<TestConfig>,
+{
+    let var_names = vars
+        .iter()
+        .map(|(name, _)| VarName::new(*name))
+        .collect::<Vec<_>>();
+    let streams = vars
+        .into_iter()
+        .map(|(_, values)| Box::pin(stream::iter(values)) as OutputStream<Value>)
+        .collect::<Vec<_>>();
+    let mut ctx = Context::<TestConfig>::new(executor, var_names, streams, 8);
+    let expr = parse_expr(src);
+    let output = S::to_async_stream(&expr, &ctx, None);
+    ctx.run().await;
+    output.collect().await
+}
+
+fn eval_dataflow_spec(
+    spec: DsrvSpecification,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+) -> Vec<BTreeMap<VarName, Value>> {
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let input_len = inputs.values().next().map_or(0, Vec::len);
+    assert!(inputs.values().all(|values| values.len() == input_len));
+    let input_columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| &inputs[var])
+        .collect::<Vec<_>>();
+    let output_vars = monitor.output_vars().to_vec();
+    let mut rows = Vec::with_capacity(input_len);
+
+    let columns = input_columns.into_iter().cloned().collect::<Vec<_>>();
+    let output = evaluate(&mut monitor, &columns);
+    for tick in 0..input_len {
+        rows.push(
+            output_vars
+                .iter()
+                .cloned()
+                .zip(output.iter().map(|column| column[tick].clone()))
+                .collect(),
+        );
+    }
+    rows
+}
+
+fn eval_dataflow(src: &str, vars: Vec<(&str, Vec<Value>)>) -> Vec<Value> {
+    let spec_src = vars
+        .iter()
+        .map(|(name, _)| format!("in {name}"))
+        .chain(["out result".to_owned(), format!("result = {src}")])
+        .collect::<Vec<_>>()
+        .join("\n");
+    let spec = spec_src.as_str().parse::<DsrvSpecification>().unwrap();
+    let inputs = vars
+        .into_iter()
+        .map(|(name, values)| (VarName::new(name), values))
+        .collect();
+    eval_dataflow_spec(spec, inputs)
+        .into_iter()
+        .map(|mut row| row.remove(&VarName::new("result")).unwrap())
+        .collect()
+}
+
+async fn assert_matches_current(
+    executor: Rc<LocalExecutor<'static>>,
+    src: &str,
+    vars: Vec<(&str, Vec<Value>)>,
+) {
+    let expected = eval_with::<UntimedDsrvSemantics>(executor.clone(), src, vars.clone()).await;
+    let actual = eval_dataflow(src, vars);
+    assert_eq!(actual, expected, "dataflow differed for `{src}`");
+}
+
+async fn eval_runtime_with<S>(
+    executor: Rc<LocalExecutor<'static>>,
+    spec: DsrvSpecification,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+    limit: usize,
+) -> Vec<BTreeMap<VarName, Value>>
+where
+    S: MonitoringSemantics<TestConfig>,
+{
+    let mut output_handler = Box::new(ManualOutputHandler::new(
+        executor.clone(),
+        spec.output_vars.clone(),
+    ));
+    let outputs = output_handler.get_output();
+    let runtime = AsyncRuntimeBuilder::<TestConfig, S>::new()
+        .executor(executor.clone())
+        .model(spec)
+        .input(map::input_stream(inputs))
+        .output(output_handler)
+        .build()
+        .await;
+
+    executor.spawn(runtime.run()).detach();
+    outputs.take(limit).collect().await
+}
+
+async fn eval_dataflow_runtime(
+    executor: Rc<LocalExecutor<'static>>,
+    spec: DsrvSpecification,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+    limit: usize,
+) -> Vec<BTreeMap<VarName, Value>> {
+    let mut output_handler = Box::new(ManualOutputHandler::new(
+        executor.clone(),
+        spec.output_vars.clone(),
+    ));
+    let outputs = output_handler.get_output();
+    let runtime = DataflowRuntimeBuilder::<DsrvSpecification>::new()
+        .executor(executor.clone())
+        .model(spec)
+        .input(map::input_stream(inputs))
+        .output(output_handler)
+        .build()
+        .await;
+
+    executor.spawn(runtime.run()).detach();
+    outputs.take(limit).collect().await
+}
+
+async fn eval_specialized_dataflow_runtime(
+    executor: Rc<LocalExecutor<'static>>,
+    spec: CheckedDsrvSpecification,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+    limit: usize,
+) -> Vec<BTreeMap<VarName, Value>> {
+    let mut output_handler = Box::new(ManualOutputHandler::new(
+        executor.clone(),
+        spec.output_vars().clone(),
+    ));
+    let outputs = output_handler.get_output();
+    let runtime = DataflowRuntimeBuilder::<CheckedDsrvSpecification>::new()
+        .executor(executor.clone())
+        .model(spec)
+        .input(map::input_stream(inputs))
+        .output(output_handler)
+        .build()
+        .await;
+
+    executor.spawn(runtime.run()).detach();
+    outputs.take(limit).collect().await
+}
+
+async fn eval_semisync_runtime(
+    executor: Rc<LocalExecutor<'static>>,
+    spec: DsrvSpecification,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+    limit: usize,
+) -> Vec<BTreeMap<VarName, Value>> {
+    let mut output_handler = Box::new(ManualOutputHandler::new(
+        executor.clone(),
+        spec.output_vars.clone(),
+    ));
+    let outputs = output_handler.get_output();
+    let runtime = SemiSyncRuntimeBuilder::<SemiSyncValueConfig, UntimedDsrvSemantics>::new()
+        .executor(executor.clone())
+        .model(spec)
+        .input(map::input_stream(inputs))
+        .output(output_handler)
+        .build()
+        .await;
+
+    executor.spawn(runtime.run()).detach();
+    outputs.take(limit).collect().await
+}
+
+async fn assert_runtime_parity(
+    executor: Rc<LocalExecutor<'static>>,
+    spec: DsrvSpecification,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+) -> Vec<BTreeMap<VarName, Value>> {
+    let ticks = inputs.values().next().map_or(0, Vec::len);
+    assert!(
+        inputs.values().all(|values| values.len() == ticks),
+        "parity test inputs must describe complete logical rows"
+    );
+    let checked_spec = spec
+        .clone()
+        .type_check(TypeCheckOptions::STRICT)
+        .expect("parity specifications must pass strict type checking");
+    let spec_trace = format!("{spec:#?}");
+    let input_trace = format!("{inputs:#?}");
+    let dataflow = with_timeout(
+        eval_dataflow_runtime(executor.clone(), spec.clone(), inputs.clone(), ticks),
+        10,
+        "unspecialized dataflow parity runtime",
+    )
+    .await
+    .expect("unspecialized dataflow parity runtime did not produce the expected outputs");
+    let specialized = with_timeout(
+        eval_specialized_dataflow_runtime(executor.clone(), checked_spec, inputs.clone(), ticks),
+        10,
+        "specialized dataflow parity runtime",
+    )
+    .await
+    .expect("specialized dataflow parity runtime did not produce the expected outputs");
+    let semisync = with_timeout(
+        eval_semisync_runtime(executor.clone(), spec, inputs, ticks),
+        10,
+        "semi-sync parity runtime",
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "semi-sync parity runtime did not produce the expected outputs: {error}\n\
+             specification:\n{spec_trace}\ninputs:\n{input_trace}"
+        )
+    });
+    assert_eq!(
+        specialized, dataflow,
+        "specialized and unspecialized dataflow differed for:\n{spec_trace}\ninputs:\n{input_trace}"
+    );
+    assert_eq!(
+        specialized, semisync,
+        "specialized dataflow and semi-sync differed for:\n{spec_trace}\ninputs:\n{input_trace}"
+    );
+    specialized
+}
+
+async fn assert_dataflow_semisync_runtime_parity(
+    executor: Rc<LocalExecutor<'static>>,
+    spec_src: &str,
+    inputs: BTreeMap<VarName, Vec<Value>>,
+) -> Vec<BTreeMap<VarName, Value>> {
+    let ticks = inputs.values().next().map_or(0, Vec::len);
+    assert!(
+        inputs.values().all(|values| values.len() == ticks),
+        "parity test inputs must describe complete logical rows"
+    );
+    let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+    let input_trace = format!("{inputs:#?}");
+    let dataflow = with_timeout(
+        eval_dataflow_runtime(executor.clone(), spec.clone(), inputs.clone(), ticks),
+        10,
+        "dataflow parity runtime",
+    )
+    .await
+    .expect("dataflow parity runtime did not produce the expected outputs");
+    let semisync = with_timeout(
+        eval_semisync_runtime(executor, spec, inputs, ticks),
+        10,
+        "semi-sync parity runtime",
+    )
+    .await
+    .expect("semi-sync parity runtime did not produce the expected outputs");
+    assert_eq!(
+        dataflow, semisync,
+        "dataflow and semi-sync differed for:\n{spec_src}\ninputs:\n{input_trace}"
+    );
+    dataflow
+}
+
+fn dynamic_inputs(rows: &[DynamicInputRow]) -> BTreeMap<VarName, Vec<Value>> {
+    BTreeMap::from([
+        (
+            VarName::new("x"),
+            rows.iter().map(|(x, _, _)| x.clone()).collect(),
+        ),
+        (
+            VarName::new("y"),
+            rows.iter().map(|(_, y, _)| y.clone()).collect(),
+        ),
+        (
+            VarName::new("source"),
+            rows.iter().map(|(_, _, source)| source.clone()).collect(),
+        ),
+    ])
+}
+
+fn assert_generated_runtime_parity(spec: DsrvSpecification, inputs: BTreeMap<VarName, Vec<Value>>) {
+    let executor: Rc<LocalExecutor<'static>> = Rc::new(LocalExecutor::new());
+    smol::block_on(executor.run(assert_runtime_parity(executor.clone(), spec, inputs)));
+}
+
+fn output_trace(rows: &[BTreeMap<VarName, Value>], name: &str) -> Vec<Value> {
+    let name = VarName::new(name);
+    rows.iter().map(|row| row[&name].clone()).collect()
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_mutually_delayed_streams_parity(executor: Rc<LocalExecutor<'static>>) {
+    let inputs = BTreeMap::from([
+        (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+        (VarName::new("y"), vec![10.into(), 20.into(), 30.into()]),
+    ]);
+
+    let mutual = assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin y: Int\nout a: Int\nout b: Int\n\
+         a = default(b[1], 0) + x\nb = default(a[1], 0) + y",
+        inputs.clone(),
+    )
+    .await;
+    assert_eq!(
+        output_trace(&mutual, "a"),
+        vec![1.into(), 12.into(), 24.into()]
+    );
+    assert_eq!(
+        output_trace(&mutual, "b"),
+        vec![10.into(), 21.into(), 42.into()]
+    );
+
+    let mixed = assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin y: Int\nout a: Int\nout b: Int\n\
+         a = default(b[1], 0) + x\nb = a + y",
+        inputs.clone(),
+    )
+    .await;
+    assert_eq!(
+        output_trace(&mixed, "a"),
+        vec![1.into(), 13.into(), 36.into()]
+    );
+    assert_eq!(
+        output_trace(&mixed, "b"),
+        vec![11.into(), 33.into(), 66.into()]
+    );
+
+    let direct_function = assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin y: Int\nout a: Int\nout b: Int\n\
+         a = (\\v: Int -> default(b[1], 0) + v)(x)\n\
+         b = (\\v: Int -> default(a[1], 0) + v)(y)",
+        inputs.clone(),
+    )
+    .await;
+    assert_eq!(direct_function, mutual);
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_delayed_cycle_offsets_and_branches_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let offsets = assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin y: Int\nout a: Int\nout b: Int\n\
+         a = default(b[2], 100) + x\nb = default(a[1], 200) + y",
+        BTreeMap::from([
+            (
+                VarName::new("x"),
+                vec![1.into(), 2.into(), 3.into(), 4.into()],
+            ),
+            (
+                VarName::new("y"),
+                vec![10.into(), 20.into(), 30.into(), 40.into()],
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        output_trace(&offsets, "a"),
+        vec![101.into(), 102.into(), 213.into(), 125.into()]
+    );
+    assert_eq!(
+        output_trace(&offsets, "b"),
+        vec![210.into(), 121.into(), 132.into(), 253.into()]
+    );
+
+    let branches = assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in flag: Bool\nin x: Int\nin y: Int\nout a: Int\nout b: Int\n\
+         a = if flag then default(b[1], 0) + x else x\nb = a + y",
+        BTreeMap::from([
+            (
+                VarName::new("flag"),
+                vec![true.into(), false.into(), true.into()],
+            ),
+            (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+            (VarName::new("y"), vec![10.into(), 20.into(), 30.into()]),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        output_trace(&branches, "a"),
+        vec![1.into(), 2.into(), 25.into()]
+    );
+    assert_eq!(
+        output_trace(&branches, "b"),
+        vec![11.into(), 22.into(), 55.into()]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_maple_sequence_parity(executor: Rc<LocalExecutor<'static>>) {
+    let stages = ["m", "a", "p", "l", "e", "m", "a", "p", "l", "e"]
+        .into_iter()
+        .map(|stage| Value::Str(stage.into()))
+        .collect::<Vec<_>>();
+    let rows = assert_dataflow_semisync_runtime_parity(
+        executor,
+        crate::dsrv_fixtures::spec_maple_sequence(),
+        BTreeMap::from([(VarName::new("stage"), stages)]),
+    )
+    .await;
+    assert_eq!(output_trace(&rows, "maple"), vec![Value::Bool(true); 10]);
+}
+
+#[test]
+fn dataflow_delayed_cycles_compile_typed_and_untyped() {
+    let spec = "in x: Int\nin y: Int\nout a: Int\nout b: Int\n\
+         a = default(b[1], 0) + x\nb = default(a[1], 0) + y"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let typed = spec.clone().type_check(TypeCheckOptions::STRICT).unwrap();
+
+    for mut monitor in [
+        DataflowMonitor::compile_untyped(spec).unwrap(),
+        DataflowMonitor::compile_checked(typed).unwrap(),
+    ] {
+        assert_eq!(
+            evaluate(
+                &mut monitor,
+                &[
+                    vec![1.into(), 2.into(), 3.into()],
+                    vec![10.into(), 20.into(), 30.into()]
+                ],
+            ),
+            vec![
+                vec![1.into(), 12.into(), 24.into()],
+                vec![10.into(), 21.into(), 42.into()],
+            ]
+        );
+    }
+}
+
+#[test]
+fn dataflow_runtime_compiled_mutual_delays_commit_once_per_tick() {
+    let spec = "in x: Int\nin y: Int\nin a_source: Str\nin b_source: Str\n\
+         out a: Int\nout b: Int\na = dynamic(a_source: Int)\nb = dynamic(b_source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let typed = spec.clone().type_check(TypeCheckOptions::STRICT).unwrap();
+
+    for mut monitor in [
+        DataflowMonitor::compile_untyped(spec).unwrap(),
+        DataflowMonitor::compile_checked(typed).unwrap(),
+    ] {
+        let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+        for (x, y, expected_a, expected_b) in [(1, 10, 1, 10), (2, 20, 12, 21), (3, 30, 24, 42)] {
+            let input = runtime_input_row(
+                &monitor,
+                &[
+                    ("x", x.into()),
+                    ("y", y.into()),
+                    ("a_source", Value::Str("default(b[1], 0) + x".into())),
+                    ("b_source", Value::Str("default(a[1], 0) + y".into())),
+                ],
+            );
+            monitor.evaluate(&input, &mut output).unwrap();
+            assert_eq!(runtime_output(&monitor, &output, "a"), expected_a.into());
+            assert_eq!(runtime_output(&monitor, &output, "b"), expected_b.into());
+        }
+    }
+}
+
+#[test]
+fn dynamic_source_replacement_uses_retained_value_for_new_no_val_dependency() {
+    let spec = "in x: Int\nin y: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let typed = spec.clone().type_check(TypeCheckOptions::STRICT).unwrap();
+
+    for mut monitor in [
+        DataflowMonitor::compile_untyped(spec.clone()).unwrap(),
+        DataflowMonitor::compile_checked(typed).unwrap(),
+    ] {
+        let mut output = [Value::NoVal];
+        let first = runtime_input_row(
+            &monitor,
+            &[
+                ("x", Value::Int(10)),
+                ("y", Value::Int(20)),
+                ("source", Value::Str("x".into())),
+            ],
+        );
+        monitor.evaluate(&first, &mut output).unwrap();
+        assert_eq!(output, [Value::Int(10)]);
+
+        let replacement = runtime_input_row(
+            &monitor,
+            &[
+                ("x", Value::NoVal),
+                ("y", Value::NoVal),
+                ("source", Value::Str("y".into())),
+            ],
+        );
+        monitor.evaluate(&replacement, &mut output).unwrap();
+        assert_eq!(output, [Value::Int(20)]);
+    }
+}
+
+#[test]
+fn dynamic_environment_slots_include_delayed_free_variables() {
+    let spec = "in x: Int\nin source: Str\nout z: Int\
+                \nz = dynamic(source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let typed = spec.clone().type_check(TypeCheckOptions::STRICT).unwrap();
+
+    for mut monitor in [
+        DataflowMonitor::compile_untyped(spec).unwrap(),
+        DataflowMonitor::compile_checked(typed).unwrap(),
+    ] {
+        let mut output = [Value::NoVal];
+        for (x, expected) in [
+            (Value::Int(3), Value::Int(0)),
+            (Value::Int(4), Value::Int(3)),
+        ] {
+            let input = runtime_input_row(
+                &monitor,
+                &[("x", x), ("source", Value::Str("default(x[1], 0)".into()))],
+            );
+            monitor.evaluate(&input, &mut output).unwrap();
+            assert_eq!(output, [expected]);
+        }
+    }
+}
+
+#[test]
+fn dynamic_no_val_source_and_dependency_reuse_retained_outer_values() {
+    let spec = "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let mut output = [Value::NoVal];
+
+    let activation = runtime_input_row(
+        &monitor,
+        &[("x", Value::Int(9)), ("source", Value::Str("x + 1".into()))],
+    );
+    monitor.evaluate(&activation, &mut output).unwrap();
+    assert_eq!(output, [Value::Int(10)]);
+
+    let no_values = runtime_input_row(&monitor, &[("x", Value::NoVal), ("source", Value::NoVal)]);
+    monitor.evaluate(&no_values, &mut output).unwrap();
+    assert_eq!(output, [Value::Int(10)]);
+}
+
+#[test]
+fn dataflow_delay_state_persists_across_evaluations() {
+    let spec = "in x\nout z\nz = default(z[3], 0) + x"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+
+    assert_eq!(
+        evaluate(&mut monitor, &[vec![1.into(), 2.into()]]),
+        vec![vec![1.into(), 2.into()]]
+    );
+    assert_eq!(
+        evaluate(&mut monitor, &[vec![3.into(), 4.into()]]),
+        vec![vec![3.into(), 5.into()]]
+    );
+}
+
+#[test]
+fn dataflow_state_is_shared_between_event_and_row_evaluation() {
+    let spec = "in x\nout z\nz = default(z[1], 0) + x"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+
+    assert_eq!(
+        evaluate_events(
+            &mut monitor,
+            &[InputEvent::new(VarName::new("x"), Value::Int(1),)]
+        ),
+        vec![vec![1.into()]]
+    );
+    assert_eq!(
+        evaluate(&mut monitor, &[vec![2.into(), 3.into()]]),
+        vec![vec![3.into(), 6.into()]]
+    );
+}
+
+#[test]
+fn dataflow_input_and_output_counts_are_validated() {
+    let spec = "in x\nin y\nout z\nz = y"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+
+    let missing = [Value::Int(1)];
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+    assert!(matches!(
+        monitor.evaluate(&missing, &mut output),
+        Err(DataflowEvaluationError::InputCountMismatch { .. })
+    ));
+
+    let valid = [Value::Int(1), Value::Int(10)];
+    assert!(matches!(
+        monitor.evaluate(&valid, &mut []),
+        Err(DataflowEvaluationError::OutputCountMismatch { .. })
+    ));
+}
+
+#[test]
+fn dataflow_compilers_accept_zero_stream_indices() {
+    let spec = "in x: Int\nout z: Int\nz = x[0]"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+
+    DataflowMonitor::compile_untyped(spec.clone())
+        .expect("untyped compilation should accept a zero stream index");
+    let typed = spec
+        .type_check(TypeCheckOptions::STRICT)
+        .expect("zero stream index should type check");
+    DataflowMonitor::compile_checked(typed)
+        .expect("typed compilation should accept a zero stream index");
+}
+
+#[test]
+fn dataflow_compilation_reports_computed_dependency_cycles() {
+    let spec = "in x\nout z\naux a\naux b\na = b + x\nb = a + x\nz = a"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+
+    let error = match DataflowMonitor::compile_untyped(spec) {
+        Ok(_) => panic!("computed dependency cycle should be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(error, DataflowCompilationError::DependencyCycle(_)),
+        "unexpected compile error: {error:?}"
+    );
+}
+
+#[test]
+fn dataflow_compilation_reports_unavailable_variables() {
+    let spec = "out z\nz = missing + 1"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+
+    let error = match DataflowMonitor::compile_untyped(spec) {
+        Ok(_) => panic!("unavailable input should be rejected"),
+        Err(error) => error,
+    };
+
+    match error {
+        DataflowCompilationError::UnavailableVariables { variables, .. } => {
+            assert_eq!(variables, [VarName::new("missing")]);
+        }
+        error => panic!("unexpected compile error: {error:?}"),
+    }
+}
+
+#[test]
+fn dataflow_rejects_unguarded_recursive_output() {
+    let spec = "in x\nout z\nz = z + x"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let error = DataflowMonitor::compile_untyped(spec)
+        .err()
+        .expect("unguarded recursion should be rejected");
+
+    assert!(
+        error.to_string().contains("positive stream delay"),
+        "unexpected compile error: {error}"
+    );
+}
+
+#[test]
+fn dataflow_rejects_direct_recursive_output() {
+    let spec = "out z\nz = z".parse::<DsrvSpecification>().unwrap();
+    let error = DataflowMonitor::compile_untyped(spec)
+        .err()
+        .expect("direct recursion should be rejected");
+
+    assert!(
+        error.to_string().contains("positive stream delay"),
+        "unexpected compile error: {error}"
+    );
+}
+
+#[test]
+fn dataflow_rejects_recursive_branch_output() {
+    let spec = "in choose\nout z\nz = if choose then z else 0"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let error = DataflowMonitor::compile_untyped(spec)
+        .err()
+        .expect("recursive branch output should be rejected");
+
+    assert!(
+        error.to_string().contains("positive stream delay"),
+        "unexpected compile error: {error}"
+    );
+}
+
+#[test]
+fn dataflow_rejects_recursive_function_capture() {
+    let spec = "out z\nz = (\\v: Int -> z)(1)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let error = DataflowMonitor::compile_untyped(spec)
+        .err()
+        .expect("recursive function capture should be rejected");
+
+    assert!(
+        error.to_string().contains("positive stream delay"),
+        "unexpected compile error: {error}"
+    );
+}
+
+#[test]
+fn dataflow_preserves_temporal_state_in_direct_functions() {
+    let spec = "in x: Int\nout z: Int\nz = (\\v: Int -> v[1])(x)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([(
+            VarName::new("x"),
+            vec![1.into(), 2.into(), 3.into(), 4.into()],
+        )]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![Value::Deferred, 1.into(), 2.into(), 3.into()]);
+}
+
+#[test]
+fn dataflow_updates_captures_of_persistent_direct_functions() {
+    let spec = "in x: Int\nin bias: Int\nout z: Int\nz = (\\v: Int -> v[1] + bias)(x)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([
+            (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+            (VarName::new("bias"), vec![10.into(), 20.into(), 30.into()]),
+        ]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![Value::Deferred, 21.into(), 32.into()]);
+}
+
+#[test]
+fn dataflow_preserves_temporal_state_in_first_class_functions() {
+    let spec = "in x: Int\naux f: (Int -> Int)\nout z: Int\nf = \\v: Int -> v[1]\nz = f(x)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([(
+            VarName::new("x"),
+            vec![1.into(), 2.into(), 3.into(), 4.into()],
+        )]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![Value::Deferred, 1.into(), 2.into(), 3.into()]);
+}
+
+#[test]
+fn dataflow_updates_captures_of_first_class_function_instances() {
+    let spec = "in x: Int\nin bias: Int\naux f: (Int -> Int)\nout z: Int\n\
+         f = \\v: Int -> v[1] + bias\nz = f(x)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([
+            (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+            (VarName::new("bias"), vec![10.into(), 20.into(), 30.into()]),
+        ]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![Value::Deferred, 21.into(), 32.into()]);
+}
+
+#[test]
+fn dataflow_function_switching_starts_a_new_call_site_instance() {
+    let spec = "in x: Int\nin choose: Bool\naux f: (Int -> Int)\naux g: (Int -> Int)\n\
+         out z: Int\nf = \\v: Int -> v[1]\ng = \\v: Int -> v[1]\n\
+         z = (if choose then f else g)(x)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([
+            (
+                VarName::new("x"),
+                vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()],
+            ),
+            (
+                VarName::new("choose"),
+                vec![
+                    true.into(),
+                    true.into(),
+                    false.into(),
+                    false.into(),
+                    true.into(),
+                ],
+            ),
+        ]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        values,
+        vec![
+            Value::Deferred,
+            1.into(),
+            Value::Deferred,
+            3.into(),
+            Value::Deferred,
+        ]
+    );
+}
+
+#[test]
+fn dataflow_keeps_stateless_collection_functions_pointwise() {
+    let spec = "in xs: List<Int>\nout z: List<Int>\nz = List.map(\\v: Int -> v + 1, xs)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([(
+            VarName::new("xs"),
+            vec![Value::List(vec![1.into(), 2.into()].into())],
+        )]),
+    );
+    assert_eq!(
+        rows[0][&VarName::new("z")],
+        Value::List(vec![2.into(), 3.into()].into())
+    );
+}
+
+#[test]
+fn dataflow_applies_partially_applied_auxiliary_functions() {
+    let spec = "in x: Int\nin bias: Int\nout z: Int\naux add_bias\nadd_bias = partial(\\left: Int, right: Int -> left + right, bias)\nz = add_bias(x)".parse::<DsrvSpecification>().unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([
+            (VarName::new("x"), vec![1.into(), 2.into(), 3.into()]),
+            (VarName::new("bias"), vec![10.into(), 20.into(), 30.into()]),
+        ]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![11.into(), 22.into(), 33.into()]);
+}
+
+#[test]
+fn dataflow_applies_fixed_auxiliary_functions() {
+    let spec = "in x: Int\nout z: Int\naux increment\nincrement = fix(\\self: (Int -> Int), value: Int -> value + 1)\nz = increment(x)".parse::<DsrvSpecification>().unwrap();
+    let rows = eval_dataflow_spec(
+        spec,
+        BTreeMap::from([(VarName::new("x"), vec![1.into(), 2.into(), 3.into()])]),
+    );
+    let values = rows
+        .into_iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(values, vec![2.into(), 3.into(), 4.into()]);
+}
+
+#[test]
+fn dataflow_rejects_temporal_collection_functions() {
+    let spec = "in xs: List<Int>\nout z: List<Int>\nz = List.map(\\v: Int -> v[1], xs)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let error = DataflowMonitor::compile_untyped(spec)
+        .err()
+        .expect("temporal collection callback should be rejected");
+
+    assert!(error.to_string().contains("collection callback"));
+}
+
+#[test]
+fn dataflow_evaluates_ticks_without_inputs() {
+    let spec = "out z\nz = 42".parse::<DsrvSpecification>().unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+    for _ in 0..3 {
+        monitor.evaluate(&[], &mut output).unwrap();
+        assert_eq!(output, vec![42.into()]);
+    }
+}
+
+#[test]
+fn dataflow_dynamic_waits_for_computed_context_streams() {
+    let spec = "in x: Int\nin source: Str\nout before: Int\naux z: Int\nbefore = dynamic(source: Int, {z})\nz = x + 1".parse::<DsrvSpecification>().unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (VarName::new("x"), vec![1.into(), 2.into()]),
+        (
+            VarName::new("source"),
+            vec![Value::Str("z".into()), Value::Str("z".into())],
+        ),
+    ]);
+    let columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var[var].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        evaluate(&mut monitor, &columns),
+        vec![vec![2.into(), 3.into()]]
+    );
+}
+
+#[test]
+fn dataflow_explicit_full_dynamic_scope_keeps_computed_dependencies() {
+    let spec = "in x: Int\nin source: Str\nout before: Int\naux z: Int\nbefore = dynamic(source: Int, {x, source, z})\nz = x + 1".parse::<DsrvSpecification>().unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (VarName::new("x"), vec![1.into(), 2.into()]),
+        (
+            VarName::new("source"),
+            vec![Value::Str("z".into()), Value::Str("z".into())],
+        ),
+    ]);
+    let columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var[var].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        evaluate(&mut monitor, &columns),
+        vec![vec![2.into(), 3.into()]]
+    );
+}
+
+fn runtime_input_row(monitor: &DataflowMonitor, values: &[(&str, Value)]) -> Vec<Value> {
+    monitor
+        .input_vars()
+        .iter()
+        .map(|var| {
+            values
+                .iter()
+                .find_map(|(name, value)| (var == &VarName::new(name)).then(|| value.clone()))
+                .unwrap_or_else(|| panic!("missing value for input `{var}`"))
+        })
+        .collect()
+}
+
+fn runtime_output(monitor: &DataflowMonitor, output: &[Value], name: &str) -> Value {
+    let index = monitor
+        .output_vars()
+        .iter()
+        .position(|var| var == &VarName::new(name))
+        .unwrap_or_else(|| panic!("missing output `{name}`"));
+    output[index].clone()
+}
+
+#[test]
+fn dataflow_automatic_dynamic_scope_can_introduce_a_computed_dependency() {
+    let spec = "in x: Int\nin source: Str\nout before: Int\naux intermediate: Int\n\
+                        before = dynamic(source: Int)\nintermediate = x + 1"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let typed = spec.clone().type_check(TypeCheckOptions::STRICT).unwrap();
+    for mut monitor in [
+        DataflowMonitor::compile_untyped(spec).unwrap(),
+        DataflowMonitor::compile_checked(typed).unwrap(),
+    ] {
+        let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+        let input = runtime_input_row(
+            &monitor,
+            &[
+                ("x", 4.into()),
+                ("source", Value::Str("intermediate".into())),
+            ],
+        );
+
+        monitor.evaluate(&input, &mut output).unwrap();
+
+        assert_eq!(runtime_output(&monitor, &output, "before"), Value::Int(5));
+    }
+}
+
+#[test]
+fn dataflow_multiple_dynamics_reorder_atomically_when_dependencies_reverse() {
+    let spec = "in x: Int\nin a_source: Str\nin b_source: Str\nout a: Int\nout b: Int\n\
+                        a = dynamic(a_source: Int)\nb = dynamic(b_source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let typed = spec.clone().type_check(TypeCheckOptions::STRICT).unwrap();
+    for mut monitor in [
+        DataflowMonitor::compile_untyped(spec).unwrap(),
+        DataflowMonitor::compile_checked(typed).unwrap(),
+    ] {
+        let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+        let first = runtime_input_row(
+            &monitor,
+            &[
+                ("x", 10.into()),
+                ("a_source", Value::Str("b + 1".into())),
+                ("b_source", Value::Str("x".into())),
+            ],
+        );
+        monitor.evaluate(&first, &mut output).unwrap();
+        assert_eq!(runtime_output(&monitor, &output, "a"), Value::Int(11));
+        assert_eq!(runtime_output(&monitor, &output, "b"), Value::Int(10));
+
+        let second = runtime_input_row(
+            &monitor,
+            &[
+                ("x", 20.into()),
+                ("a_source", Value::Str("x".into())),
+                ("b_source", Value::Str("a + 1".into())),
+            ],
+        );
+        monitor.evaluate(&second, &mut output).unwrap();
+        assert_eq!(runtime_output(&monitor, &output, "a"), Value::Int(20));
+        assert_eq!(runtime_output(&monitor, &output, "b"), Value::Int(21));
+    }
+}
+
+#[test]
+fn dataflow_dependency_reordering_advances_temporal_state_once() {
+    let spec = "in x: Int\nin a_source: Str\nin b_source: Str\nout a: Int\nout b: Int\n\
+                        a = dynamic(a_source: Int)\nb = dynamic(b_source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+    for (x, expected) in [(10, 0), (20, 10)] {
+        let input = runtime_input_row(
+            &monitor,
+            &[
+                ("x", x.into()),
+                ("a_source", Value::Str("default(b[1], 0)".into())),
+                ("b_source", Value::Str("x".into())),
+            ],
+        );
+        monitor.evaluate(&input, &mut output).unwrap();
+        assert_eq!(runtime_output(&monitor, &output, "a"), Value::Int(expected));
+    }
+}
+
+#[test]
+fn dataflow_runtime_dependency_cycles_are_terminal_errors() {
+    let spec = "in x: Int\nin a_source: Str\nin b_source: Str\nout a: Int\nout b: Int\n\
+                        a = dynamic(a_source: Int)\nb = dynamic(b_source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+    let valid = runtime_input_row(
+        &monitor,
+        &[
+            ("x", 1.into()),
+            ("a_source", Value::Str("x".into())),
+            ("b_source", Value::Str("a".into())),
+        ],
+    );
+    monitor.evaluate(&valid, &mut output).unwrap();
+
+    let cycle = runtime_input_row(
+        &monitor,
+        &[
+            ("x", 2.into()),
+            ("a_source", Value::Str("b".into())),
+            ("b_source", Value::Str("a".into())),
+        ],
+    );
+    assert!(matches!(
+        monitor.evaluate(&cycle, &mut output),
+        Err(DataflowEvaluationError::DynamicDependencyCycle(_))
+    ));
+    assert!(matches!(
+        monitor.evaluate(&cycle, &mut output),
+        Err(DataflowEvaluationError::MonitorFailed)
+    ));
+}
+
+#[test]
+fn dataflow_defer_reorders_once_and_ignores_later_definitions() {
+    let spec = "in x: Int\nin a_source: Str\nin b_source: Str\nout a: Int\nout b: Int\n\
+                        a = defer(a_source: Int)\nb = defer(b_source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+    for (x, a_source, b_source, expected_a, expected_b) in
+        [(10, "b + 1", "x", 11, 10), (20, "x", "a + 1", 21, 20)]
+    {
+        let input = runtime_input_row(
+            &monitor,
+            &[
+                ("x", x.into()),
+                ("a_source", Value::Str(a_source.into())),
+                ("b_source", Value::Str(b_source.into())),
+            ],
+        );
+        monitor.evaluate(&input, &mut output).unwrap();
+        assert_eq!(
+            runtime_output(&monitor, &output, "a"),
+            Value::Int(expected_a)
+        );
+        assert_eq!(
+            runtime_output(&monitor, &output, "b"),
+            Value::Int(expected_b)
+        );
+    }
+}
+
+#[test]
+fn dataflow_rejects_nested_reconfiguration_before_installation() {
+    let spec_src = "in source: Str\nin secret: Int\nout z: Int\nz = dynamic(source: Int, {source})";
+    let spec = spec_src.parse::<DsrvSpecification>().unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (
+            VarName::new("source"),
+            vec![Value::Str("dynamic(\"secret\": Int)".into())],
+        ),
+        (VarName::new("secret"), vec![42.into()]),
+    ]);
+    let columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var[var].clone())
+        .collect::<Vec<_>>();
+    let input = columns
+        .iter()
+        .map(|column| column[0].clone())
+        .collect::<Vec<_>>();
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+    assert!(matches!(
+        monitor.evaluate(&input, &mut output),
+        Err(DataflowEvaluationError::UnsupportedNestedReconfiguration)
+    ));
+}
+
+#[test]
+fn dataflow_automatic_scope_does_not_add_unused_computed_dependencies() {
+    let spec = "in x: Int\nin source: Str\nout dynamic_out: Int\naux downstream: Int\ndynamic_out = dynamic(source: Int)\ndownstream = dynamic_out + 1".parse::<DsrvSpecification>().unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (VarName::new("x"), vec![1.into(), 2.into()]),
+        (
+            VarName::new("source"),
+            vec![Value::Str("x".into()), Value::Str("x".into())],
+        ),
+    ]);
+    let columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var[var].clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        evaluate(&mut monitor, &columns),
+        vec![vec![1.into(), 2.into()]]
+    );
+}
+
+#[test]
+fn dataflow_evaluation_failures_are_returned() {
+    let spec = "in source: Str\nout z: Int\nz = dynamic(source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let input = [Value::Str("not valid dsrv syntax (".into())];
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+    assert!(matches!(
+        monitor.evaluate(&input, &mut output),
+        Err(DataflowEvaluationError::DynamicExpressionParse { .. })
+    ));
+    assert!(matches!(
+        monitor.evaluate(&input, &mut output),
+        Err(DataflowEvaluationError::MonitorFailed)
+    ));
+}
+
+#[test]
+fn checked_dataflow_rejects_dynamic_expressions_with_the_wrong_type() {
+    let spec = "in source: Str\nout z: Int\nz = dynamic(source: Int)"
+        .parse::<CheckedDsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_checked(spec).unwrap();
+    let input = [Value::Str("true".into())];
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+    assert!(matches!(
+        monitor.evaluate(&input, &mut output),
+        Err(DataflowEvaluationError::DynamicExpressionType { .. })
+    ));
+}
+
+#[test]
+fn checked_dataflow_rejects_nested_dynamic_expressions() {
+    let spec = "in inner: Str\nin outer: Str\nout z: Int\nz = dynamic(outer: Int)"
+        .parse::<CheckedDsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_checked(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (VarName::new("inner"), Value::Str("true".into())),
+        (
+            VarName::new("outer"),
+            Value::Str("dynamic(inner: Int)".into()),
+        ),
+    ]);
+    let input = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var[var].clone())
+        .collect::<Vec<_>>();
+    let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+
+    assert!(matches!(
+        monitor.evaluate(&input, &mut output),
+        Err(DataflowEvaluationError::UnsupportedNestedReconfiguration)
+    ));
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_arithmetic(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "(x + y) * 2 - 1",
+        vec![
+            ("x", vec![1.into(), 2.into(), 3.into(), 4.into()]),
+            ("y", vec![10.into(), 20.into(), 30.into(), 40.into()]),
+        ],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_lifts_sparse_binary_inputs_across_rows(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "x + y",
+        vec![
+            (
+                "x",
+                vec![Value::Int(1), Value::NoVal, Value::NoVal, Value::Int(4)],
+            ),
+            (
+                "y",
+                vec![Value::Int(10), Value::Int(20), Value::NoVal, Value::Int(40)],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[test]
+fn dataflow_event_batch_matches_sparse_rows_for_recursive_sum() {
+    let spec_src =
+        "in x: Int\nin y: Int\nout z: Int\nz = default(z[1], 0) + default(x, 0) + default(y, 0)";
+    let spec = spec_src.parse::<CheckedDsrvSpecification>().unwrap();
+    let mut row_monitor = DataflowMonitor::compile_checked(spec.clone()).unwrap();
+    let mut event_monitor = DataflowMonitor::compile_checked(spec).unwrap();
+
+    let rows = vec![
+        vec![Value::Int(1), Value::NoVal],
+        vec![Value::NoVal, Value::Int(10)],
+        vec![Value::Int(2), Value::NoVal],
+        vec![Value::NoVal, Value::Int(20)],
+    ];
+    let row_outputs = evaluate(
+        &mut row_monitor,
+        &[
+            rows.iter().map(|row| row[0].clone()).collect(),
+            rows.iter().map(|row| row[1].clone()).collect(),
+        ],
+    );
+    let event_outputs = evaluate_events(
+        &mut event_monitor,
+        &[
+            InputEvent::new(VarName::new("x"), Value::Int(1)),
+            InputEvent::new(VarName::new("y"), Value::Int(10)),
+            InputEvent::new(VarName::new("x"), Value::Int(2)),
+            InputEvent::new(VarName::new("y"), Value::Int(20)),
+        ],
+    );
+
+    assert_eq!(event_outputs, row_outputs);
+}
+
+#[test]
+fn dataflow_lazy_if_propagates_initial_no_val_from_either_branch() {
+    let spec = "in flag\nin good\nin bad\nout z\nz = if flag then good else bad"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (
+            VarName::new("flag"),
+            vec![Value::Bool(true), Value::Bool(false)],
+        ),
+        (VarName::new("good"), vec![Value::Int(1), Value::NoVal]),
+        (VarName::new("bad"), vec![Value::NoVal, Value::Int(2)]),
+    ]);
+    let input_columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var.get(var).cloned().unwrap())
+        .collect::<Vec<_>>();
+
+    let output = evaluate(&mut monitor, &input_columns);
+
+    assert_eq!(output, vec![vec![Value::NoVal, Value::Int(2)]]);
+}
+
+#[test]
+fn dataflow_lazy_if_reads_inputs_at_the_outer_tick() {
+    let spec = "in flag\nin x\nout z\nz = if flag then x else 0"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+
+    assert_eq!(
+        evaluate(
+            &mut monitor,
+            &[
+                vec![false.into(), true.into(), false.into(), true.into()],
+                vec![10.into(), 20.into(), 30.into(), 40.into()],
+            ]
+        ),
+        vec![vec![0.into(), 20.into(), 0.into(), 40.into()]]
+    );
+}
+
+#[test]
+fn dataflow_rejects_reconfiguration_points_in_fallible_lazy_branches() {
+    let spec = "in flag: Bool\n\
+                        in x: Int\n\
+                        in s: Str\n\
+                        out z: Int\n\
+                        z = if flag then dynamic(s: Int) else x"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+
+    assert!(matches!(
+        DataflowMonitor::compile_untyped(spec),
+        Err(DataflowCompilationError::UnsupportedReconfiguration { .. })
+    ));
+}
+
+#[test]
+fn dataflow_lazy_if_allows_recursive_function_base_case() {
+    let spec = "in n\n\
+                        in bias\n\
+                        out z\n\
+                        z = fix(\\self: (Int -> Int), k: Int -> if k == 0 then bias else self(k - 1) + 1)(n)".parse::<DsrvSpecification>().unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let inputs_by_var = BTreeMap::from([
+        (
+            VarName::new("n"),
+            vec![Value::Int(0), Value::Int(3), Value::Int(5)],
+        ),
+        (
+            VarName::new("bias"),
+            vec![Value::Int(10), Value::Int(10), Value::Int(2)],
+        ),
+    ]);
+    let input_columns = monitor
+        .input_vars()
+        .iter()
+        .map(|var| inputs_by_var.get(var).cloned().unwrap())
+        .collect::<Vec<_>>();
+
+    let output = evaluate(&mut monitor, &input_columns);
+
+    assert_eq!(
+        output,
+        vec![vec![Value::Int(10), Value::Int(13), Value::Int(7)]]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_comparison_and_if(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "if x > 2 then x + 10 else y",
+        vec![
+            ("x", vec![1.into(), 2.into(), 3.into(), 4.into()]),
+            ("y", vec![10.into(), 20.into(), 30.into(), 40.into()]),
+        ],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_list_operations(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "List.len(xs) + List.head(xs) + List.get(xs, 1)",
+        vec![(
+            "xs",
+            vec![
+                Value::List(vec![Value::Int(2), Value::Int(3)].into()),
+                Value::List(vec![Value::Int(4), Value::Int(6), Value::Int(8)].into()),
+            ],
+        )],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_map_operations(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        r#"Map.get(Map.insert(m, "z", x), "z") + Map.get(m, "a")"#,
+        vec![
+            ("x", vec![Value::Int(7), Value::Int(9)]),
+            (
+                "m",
+                vec![
+                    Value::Map(BTreeMap::from([("a".into(), Value::Int(1))])),
+                    Value::Map(BTreeMap::from([("a".into(), Value::Int(2))])),
+                ],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_update(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "update(x, y)",
+        vec![
+            (
+                "x",
+                vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+            ),
+            (
+                "y",
+                vec![Value::Deferred, Value::NoVal, Value::Int(30), Value::NoVal],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_latch(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "latch(x, y)",
+        vec![
+            (
+                "x",
+                vec![Value::Int(1), Value::Int(2), Value::NoVal, Value::Int(4)],
+            ),
+            (
+                "y",
+                vec![
+                    Value::NoVal,
+                    Value::Bool(true),
+                    Value::Bool(true),
+                    Value::NoVal,
+                ],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_dynamic(executor: Rc<LocalExecutor<'static>>) {
+    let _ = executor;
+    let spec = "in x: Int\nin y: Int\nin s: Str\nout z: Int\nz = dynamic(s: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let outputs = evaluate(
+        &mut monitor,
+        &[
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+            vec![Value::Int(10), Value::Int(20), Value::Int(30)],
+            vec![
+                Value::Str("x + y".into()),
+                Value::Str("x + y".into()),
+                Value::Str("x * y".into()),
+            ],
+        ],
+    );
+
+    assert_eq!(
+        outputs,
+        vec![vec![Value::Int(11), Value::Int(22), Value::Int(90)]]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_defer(executor: Rc<LocalExecutor<'static>>) {
+    let _ = executor;
+    let spec = "in x: Int\nin s: Str\nout z: Int\nz = defer(s: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let outputs = evaluate(
+        &mut monitor,
+        &[
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+            vec![Value::Deferred, Value::Str("x + 1".into()), Value::Deferred],
+        ],
+    );
+
+    assert_eq!(
+        outputs,
+        vec![vec![Value::Deferred, Value::Int(3), Value::Int(4)]]
+    );
+}
+
+#[test]
+fn typed_and_untyped_dataflow_preserve_explicit_defer_scopes() {
+    let spec = "in x: Int\nin y: Int\nin s: Str\nout z: Int\nz = defer(s: Int, {x})"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let untyped = DataflowMonitor::compile_untyped(spec.clone())
+        .expect("untyped explicit defer should compile");
+    let typed = DataflowMonitor::compile_checked(
+        spec.type_check(TypeCheckOptions::STRICT)
+            .expect("typed explicit defer should type check"),
+    )
+    .expect("typed explicit defer should compile");
+
+    for mut monitor in [untyped, typed] {
+        let values = BTreeMap::from([
+            (VarName::new("x"), Value::Int(1)),
+            (VarName::new("y"), Value::Int(2)),
+            (VarName::new("s"), Value::Str("y".into())),
+        ]);
+        let input = monitor
+            .input_vars()
+            .iter()
+            .map(|var| values[var].clone())
+            .collect::<Vec<_>>();
+        let mut output = vec![Value::NoVal; monitor.output_vars().len()];
+        assert!(
+            monitor.evaluate(&input, &mut output).is_err(),
+            "a deferred property must not access a variable outside its explicit scope"
+        );
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_dynamic_temporal_dependency_starts_at_introduction(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let _ = executor;
+    let spec = "in x: Int\nin s: Str\nout z: Int\nz = dynamic(s: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+    let outputs = evaluate(
+        &mut monitor,
+        &[
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+            vec![
+                Value::Deferred,
+                Value::Deferred,
+                Value::Str("x[1]".into()),
+                Value::Str("x[1]".into()),
+            ],
+        ],
+    );
+
+    assert_eq!(
+        outputs,
+        vec![vec![
+            Value::Deferred,
+            Value::Deferred,
+            Value::Deferred,
+            Value::Int(3),
+        ]]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_defer_activation_and_redefinition_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let rows = assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in x: Int\nin source: Str\nout z: Int\nz = defer(source: Int)",
+        BTreeMap::from([
+            (
+                VarName::new("x"),
+                vec![
+                    Value::Int(10),
+                    Value::Int(11),
+                    Value::Int(12),
+                    Value::Int(13),
+                    Value::Int(14),
+                    Value::NoVal,
+                    Value::Int(16),
+                    Value::Int(17),
+                ],
+            ),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Deferred,
+                    Value::NoVal,
+                    Value::Str("x".into()),
+                    Value::Str("x + 1".into()),
+                    Value::Deferred,
+                    Value::NoVal,
+                    Value::Str("x * 2".into()),
+                    Value::Str("x - 1".into()),
+                ],
+            ),
+        ]),
+    )
+    .await;
+
+    let actual = rows
+        .iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            Value::Deferred,
+            Value::Deferred,
+            Value::Int(12),
+            Value::Int(13),
+            Value::Int(14),
+            Value::Int(14),
+            Value::Int(16),
+            Value::Int(17),
+        ]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_replacement_and_special_source_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let rows = assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        BTreeMap::from([
+            (
+                VarName::new("x"),
+                vec![
+                    Value::Int(10),
+                    Value::Int(11),
+                    Value::Int(12),
+                    Value::Int(13),
+                    Value::Int(14),
+                    Value::Int(7),
+                    Value::Int(8),
+                ],
+            ),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("x".into()),
+                    Value::Str("x".into()),
+                    Value::NoVal,
+                    Value::Str("x + 1".into()),
+                    Value::Str("x".into()),
+                    Value::Str("x * 2".into()),
+                    Value::Str("x * 2".into()),
+                ],
+            ),
+        ]),
+    )
+    .await;
+
+    let actual = rows
+        .iter()
+        .map(|row| row[&VarName::new("z")].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            Value::Int(10),
+            Value::Int(11),
+            Value::Int(12),
+            Value::Int(14),
+            Value::Int(14),
+            Value::Int(14),
+            Value::Int(16),
+        ]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_temporal_state_across_no_val_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        BTreeMap::from([
+            (
+                VarName::new("x"),
+                vec![
+                    Value::Int(10),
+                    Value::NoVal,
+                    Value::Int(20),
+                    Value::NoVal,
+                    Value::Int(30),
+                    Value::Int(40),
+                    Value::NoVal,
+                ],
+            ),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("x[1]".into()),
+                    Value::Str("x[1]".into()),
+                    Value::NoVal,
+                    Value::Str("x[2]".into()),
+                    Value::Str("x[2]".into()),
+                    Value::Deferred,
+                    Value::Str("x[1]".into()),
+                ],
+            ),
+        ]),
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_sparse_interdependent_outputs_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let x = vec![
+        Value::Int(1),
+        Value::NoVal,
+        Value::Int(3),
+        Value::NoVal,
+        Value::Int(5),
+        Value::NoVal,
+    ];
+    let y = vec![
+        Value::NoVal,
+        Value::Int(10),
+        Value::NoVal,
+        Value::Int(20),
+        Value::NoVal,
+        Value::Int(30),
+    ];
+
+    assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin y: Int\nin source: Str\n\
+         out sum: Int\nout dynamic_value: Int\n\
+         sum = x + y\n\
+         dynamic_value = dynamic(source: Int)",
+        BTreeMap::from([
+            (VarName::new("x"), x.clone()),
+            (VarName::new("y"), y.clone()),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("x".into()),
+                    Value::NoVal,
+                    Value::Str("y".into()),
+                    Value::Deferred,
+                    Value::Str("x + y".into()),
+                    Value::NoVal,
+                ],
+            ),
+        ]),
+    )
+    .await;
+
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in x: Int\nin y: Int\nin source: Str\n\
+         out sum: Int\nout deferred_value: Int\n\
+         sum = x + y\n\
+         deferred_value = defer(source: Int)",
+        BTreeMap::from([
+            (VarName::new("x"), x),
+            (VarName::new("y"), y),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::NoVal,
+                    Value::Deferred,
+                    Value::Str("x[1]".into()),
+                    Value::Str("x".into()),
+                    Value::NoVal,
+                    Value::Deferred,
+                ],
+            ),
+        ]),
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_all_no_val_and_single_tick_boundaries(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let all_no_val = vec![Value::NoVal; 5];
+    assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        BTreeMap::from([
+            (VarName::new("x"), all_no_val.clone()),
+            (VarName::new("source"), all_no_val.clone()),
+        ]),
+    )
+    .await;
+
+    assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin source: Str\nout z: Int\nz = defer(source: Int)",
+        BTreeMap::from([
+            (VarName::new("x"), all_no_val.clone()),
+            (VarName::new("source"), all_no_val),
+        ]),
+    )
+    .await;
+
+    let single_tick = BTreeMap::from([
+        (VarName::new("x"), vec![Value::Int(7)]),
+        (VarName::new("source"), vec![Value::Str("x[1]".into())]),
+    ]);
+    assert_dataflow_semisync_runtime_parity(
+        executor.clone(),
+        "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        single_tick.clone(),
+    )
+    .await;
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in x: Int\nin source: Str\nout z: Int\nz = defer(source: Int)",
+        single_tick,
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_definition_arrival_by_stream_index_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let expressions = ["x", "x[0]", "x[1]", "x[2]", "default(x[2], 99)"];
+
+    for operator in ["dynamic", "defer"] {
+        for activation_tick in 0..4 {
+            for expression in expressions {
+                let mut sources = vec![Value::Deferred; 7];
+                sources[activation_tick] = Value::Str(expression.into());
+                sources[(activation_tick + 1)..].fill(Value::NoVal);
+                let spec =
+                    format!("in x: Int\nin source: Str\nout z: Int\nz = {operator}(source: Int)");
+                assert_dataflow_semisync_runtime_parity(
+                    executor.clone(),
+                    &spec,
+                    BTreeMap::from([
+                        (
+                            VarName::new("x"),
+                            vec![
+                                1.into(),
+                                2.into(),
+                                3.into(),
+                                4.into(),
+                                5.into(),
+                                6.into(),
+                                7.into(),
+                            ],
+                        ),
+                        (VarName::new("source"), sources),
+                    ]),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_sparse_history_by_stream_index_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for operator in ["dynamic", "defer"] {
+        for expression in ["x[0]", "x[1]", "x[2]", "default(x[2], 99)"] {
+            for presence_mask in 0_u8..16 {
+                let x = (0..4)
+                    .map(|tick| {
+                        if presence_mask & (1 << tick) == 0 {
+                            Value::NoVal
+                        } else {
+                            Value::Int(i64::from(tick + 1))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let spec =
+                    format!("in x: Int\nin source: Str\nout z: Int\nz = {operator}(source: Int)");
+                assert_dataflow_semisync_runtime_parity(
+                    executor.clone(),
+                    &spec,
+                    BTreeMap::from([
+                        (VarName::new("x"), x),
+                        (
+                            VarName::new("source"),
+                            vec![
+                                Value::Str(expression.into()),
+                                Value::NoVal,
+                                Value::NoVal,
+                                Value::NoVal,
+                            ],
+                        ),
+                    ]),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_replacement_tick_and_history_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for replacement_tick in 1..6 {
+        for replacement in ["y", "y[1]", "default(y[2], 77)"] {
+            let mut sources = vec![Value::NoVal; 7];
+            sources[0] = Value::Str("x[1]".into());
+            sources[replacement_tick] = Value::Str(replacement.into());
+            assert_dataflow_semisync_runtime_parity(
+                executor.clone(),
+                "in x: Int\nin y: Int\nin source: Str\nout z: Int\n\
+                 z = dynamic(source: Int)",
+                BTreeMap::from([
+                    (
+                        VarName::new("x"),
+                        vec![
+                            1.into(),
+                            Value::NoVal,
+                            3.into(),
+                            4.into(),
+                            Value::NoVal,
+                            6.into(),
+                            7.into(),
+                        ],
+                    ),
+                    (
+                        VarName::new("y"),
+                        vec![
+                            10.into(),
+                            20.into(),
+                            Value::NoVal,
+                            40.into(),
+                            50.into(),
+                            Value::NoVal,
+                            70.into(),
+                        ],
+                    ),
+                    (VarName::new("source"), sources),
+                ]),
+            )
+            .await;
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_special_source_runs_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let tails = [
+        vec![Value::NoVal, Value::NoVal, Value::NoVal],
+        vec![Value::Deferred, Value::NoVal, Value::NoVal],
+        vec![Value::NoVal, Value::Deferred, Value::NoVal],
+        vec![Value::Deferred, Value::Deferred, Value::NoVal],
+        vec![Value::NoVal, Value::NoVal, Value::Deferred],
+        vec![Value::Deferred, Value::NoVal, Value::Deferred],
+    ];
+
+    for initial in [Value::NoVal, Value::Deferred, Value::Str("x".into())] {
+        for tail in &tails {
+            let mut sources = vec![initial.clone()];
+            sources.extend(tail.iter().cloned());
+            sources.push(Value::Str("x[1]".into()));
+            sources.push(Value::NoVal);
+            assert_dataflow_semisync_runtime_parity(
+                executor.clone(),
+                "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+                BTreeMap::from([
+                    (
+                        VarName::new("x"),
+                        vec![
+                            1.into(),
+                            2.into(),
+                            Value::NoVal,
+                            4.into(),
+                            5.into(),
+                            Value::NoVal,
+                        ],
+                    ),
+                    (VarName::new("source"), sources),
+                ]),
+            )
+            .await;
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_compiled_expression_shapes_parity(executor: Rc<LocalExecutor<'static>>) {
+    for operator in ["dynamic", "defer"] {
+        for expression in [
+            "x + y",
+            "if flag then x else y",
+            "if flag then x[1] else y[1]",
+            "default(x[1], y)",
+            "(\\v: Int -> v + 1)(x)",
+            "(\\a: Int, b: Int -> a + b)(x, y)",
+        ] {
+            let spec = format!(
+                "in x: Int\nin y: Int\nin flag: Bool\nin source: Str\nout z: Int\n\
+                 z = {operator}(source: Int)"
+            );
+            assert_dataflow_semisync_runtime_parity(
+                executor.clone(),
+                &spec,
+                BTreeMap::from([
+                    (
+                        VarName::new("x"),
+                        vec![1.into(), Value::NoVal, 3.into(), 4.into(), Value::NoVal],
+                    ),
+                    (
+                        VarName::new("y"),
+                        vec![10.into(), 20.into(), Value::NoVal, 40.into(), 50.into()],
+                    ),
+                    (
+                        VarName::new("flag"),
+                        vec![
+                            true.into(),
+                            false.into(),
+                            Value::NoVal,
+                            true.into(),
+                            false.into(),
+                        ],
+                    ),
+                    (
+                        VarName::new("source"),
+                        vec![
+                            Value::Str(expression.into()),
+                            Value::NoVal,
+                            Value::NoVal,
+                            Value::NoVal,
+                            Value::NoVal,
+                        ],
+                    ),
+                ]),
+            )
+            .await;
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_new_input_dependencies_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for replacement in ["y", "y[1]", "default(y[2], 77)", "x + y"] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in x: Int\nin y: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), 2.into(), Value::NoVal, 4.into(), 5.into()],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![10.into(), Value::NoVal, 30.into(), 40.into(), 50.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str("x".into()),
+                        Value::NoVal,
+                        Value::Str(replacement.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_defer_late_new_input_dependency_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for expression in ["y", "y[1]", "default(y[2], 77)"] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in x: Int\nin y: Int\nin source: Str\nout z: Int\nz = defer(source: Int)",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![10.into(), Value::NoVal, 30.into(), 40.into(), 50.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Deferred,
+                        Value::NoVal,
+                        Value::Str(expression.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_new_computed_dependency_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for replacement in ["intermediate", "intermediate[1]"] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in x: Int\nin source: Str\nout z: Int\naux intermediate: Int\n\
+             intermediate = x + 1\n\
+             z = dynamic(source: Int, {x, intermediate})",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), 2.into(), Value::NoVal, 4.into(), 5.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str("x".into()),
+                        Value::NoVal,
+                        Value::Str(replacement.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_stateful_compiled_operators_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for operator in ["dynamic", "defer"] {
+        for expression in [
+            "update(x, y)",
+            "latch(x, flag)",
+            "default(x[2], y)",
+            "if when(x) then 1 else 0",
+        ] {
+            let spec = format!(
+                "in x: Int\nin y: Int\nin flag: Bool\nin source: Str\nout z: Int\n\
+                 z = {operator}(source: Int)"
+            );
+            assert_dataflow_semisync_runtime_parity(
+                executor.clone(),
+                &spec,
+                BTreeMap::from([
+                    (
+                        VarName::new("x"),
+                        vec![
+                            1.into(),
+                            Value::NoVal,
+                            3.into(),
+                            4.into(),
+                            Value::NoVal,
+                            6.into(),
+                        ],
+                    ),
+                    (
+                        VarName::new("y"),
+                        vec![
+                            Value::Deferred,
+                            Value::NoVal,
+                            30.into(),
+                            Value::NoVal,
+                            50.into(),
+                            60.into(),
+                        ],
+                    ),
+                    (
+                        VarName::new("flag"),
+                        vec![
+                            Value::NoVal,
+                            true.into(),
+                            Value::NoVal,
+                            false.into(),
+                            true.into(),
+                            Value::NoVal,
+                        ],
+                    ),
+                    (
+                        VarName::new("source"),
+                        vec![
+                            Value::Deferred,
+                            Value::Str(expression.into()),
+                            Value::NoVal,
+                            Value::NoVal,
+                            Value::NoVal,
+                            Value::NoVal,
+                        ],
+                    ),
+                ]),
+            )
+            .await;
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_switch_away_and_back_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let choices = [
+        Value::NoVal,
+        Value::Deferred,
+        Value::Str("x[1]".into()),
+        Value::Str("y[1]".into()),
+    ];
+    for sequence in 0_usize..64 {
+        let mut encoded = sequence;
+        let mut sources = vec![Value::Str("x[1]".into())];
+        for _ in 0..3 {
+            sources.push(choices[encoded % choices.len()].clone());
+            encoded /= choices.len();
+        }
+        sources.push(Value::Str("x[1]".into()));
+        sources.push(Value::NoVal);
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in x: Int\nin y: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![
+                        1.into(),
+                        Value::NoVal,
+                        3.into(),
+                        4.into(),
+                        5.into(),
+                        Value::NoVal,
+                    ],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![
+                        10.into(),
+                        20.into(),
+                        Value::NoVal,
+                        40.into(),
+                        Value::NoVal,
+                        60.into(),
+                    ],
+                ),
+                (VarName::new("source"), sources),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[test]
+fn dataflow_rejects_nested_runtime_reconfiguration() {
+    for outer in ["dynamic", "defer"] {
+        let spec =
+            format!("in x: Int\nin inner: Str\nin outer: Str\nout z: Int\nz = {outer}(outer: Int)")
+                .parse::<DsrvSpecification>()
+                .unwrap();
+        let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+        let input = runtime_input_row(
+            &monitor,
+            &[
+                ("x", Value::Int(1)),
+                ("inner", Value::Str("x".into())),
+                ("outer", Value::Str("dynamic(inner: Int)".into())),
+            ],
+        );
+        let mut output = vec![Value::NoVal; 1];
+
+        assert!(matches!(
+            monitor.evaluate(&input, &mut output),
+            Err(DataflowEvaluationError::UnsupportedNestedReconfiguration)
+        ));
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_paired_sparse_inputs_across_expression_shapes_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for x_mask in 0_u8..16 {
+        let y_mask = x_mask.rotate_left(2) ^ 0b0101;
+        let values = |mask: u8, scale: i64| {
+            (0..4)
+                .map(|tick| {
+                    if mask & (1 << tick) == 0 {
+                        Value::NoVal
+                    } else {
+                        Value::Int(scale * i64::from(tick + 1))
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for expression in [
+            "x + y",
+            "if flag then x else y",
+            "(\\a: Int, b: Int -> a + b)(x, y)",
+        ] {
+            assert_dataflow_semisync_runtime_parity(
+                executor.clone(),
+                "in x: Int\nin y: Int\nin flag: Bool\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+                BTreeMap::from([
+                    (VarName::new("x"), values(x_mask, 1)),
+                    (VarName::new("y"), values(y_mask, 10)),
+                    (VarName::new("flag"), vec![true.into(), false.into(), Value::NoVal, true.into()]),
+                    (VarName::new("source"), vec![Value::Str(expression.into()), Value::NoVal, Value::NoVal, Value::NoVal]),
+                ]),
+            ).await;
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_dynamic_result_domains_parity(executor: Rc<LocalExecutor<'static>>) {
+    let cases = [
+        (
+            "in x: Bool\nin y: Bool\nin source: Str\nout z: Bool\nz = dynamic(source: Bool)",
+            "x && y",
+            vec![true.into(), Value::NoVal, false.into(), true.into()],
+            vec![false.into(), true.into(), Value::NoVal, true.into()],
+        ),
+        (
+            "in x: Str\nin y: Str\nin source: Str\nout z: Str\nz = dynamic(source: Str)",
+            "x ++ y",
+            vec!["a".into(), Value::NoVal, "c".into(), "d".into()],
+            vec!["1".into(), "2".into(), Value::NoVal, "4".into()],
+        ),
+    ];
+
+    for (spec, expression, x, y) in cases {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            spec,
+            BTreeMap::from([
+                (VarName::new("x"), x),
+                (VarName::new("y"), y),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str(expression.into()),
+                        Value::NoVal,
+                        Value::Deferred,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in xs: List<Int>\nin x: Int\nin source: Str\nout z: List<Int>\nz = dynamic(source: List<Int>)",
+        BTreeMap::from([
+            (
+                VarName::new("xs"),
+                vec![
+                    Value::List(vec![1.into()].into()),
+                    Value::NoVal,
+                    Value::List(vec![3.into()].into()),
+                    Value::List(vec![4.into()].into()),
+                ],
+            ),
+            (VarName::new("x"), vec![10.into(), 20.into(), Value::NoVal, 40.into()]),
+            (
+                VarName::new("source"),
+                vec![Value::Str("List.append(xs, x)".into()), Value::NoVal, Value::NoVal, Value::NoVal],
+            ),
+        ]),
+    ).await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_collection_operator_lifting_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for expression in [
+        "List(x, y)",
+        "List.concat(xs, ys)",
+        "List.tail(xs)",
+        "List.map(\\v: Int -> v + 1, xs)",
+        "List.filter(\\v: Int -> v > 1, xs)",
+    ] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in x: Int\nin y: Int\nin xs: List<Int>\nin ys: List<Int>\nin source: Str\n\
+             out z: List<Int>\nz = dynamic(source: List<Int>)",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), Value::NoVal, 3.into(), 4.into()],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+                ),
+                (
+                    VarName::new("xs"),
+                    vec![
+                        Value::List(vec![1.into(), 2.into()].into()),
+                        Value::NoVal,
+                        Value::List(vec![3.into(), 4.into()].into()),
+                        Value::List(vec![4.into(), 5.into()].into()),
+                    ],
+                ),
+                (
+                    VarName::new("ys"),
+                    vec![
+                        Value::List(vec![10.into()].into()),
+                        Value::List(vec![20.into()].into()),
+                        Value::NoVal,
+                        Value::List(vec![40.into()].into()),
+                    ],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str(expression.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in xs: List<Int>\nin initial: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        BTreeMap::from([
+            (
+                VarName::new("xs"),
+                vec![
+                    Value::List(vec![1.into(), 2.into()].into()),
+                    Value::NoVal,
+                    Value::List(vec![3.into()].into()),
+                    Value::List(vec![4.into()].into()),
+                ],
+            ),
+            (
+                VarName::new("initial"),
+                vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+            ),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("List.fold(\\a: Int, v: Int -> a + v, initial, xs)".into()),
+                    Value::NoVal,
+                    Value::NoVal,
+                    Value::NoVal,
+                ],
+            ),
+        ]),
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_map_operator_lifting_parity(executor: Rc<LocalExecutor<'static>>) {
+    for expression in ["Map.insert(m, \"z\", x)", "Map.remove(m, \"a\")"] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in m: Map<Int>\nin x: Int\nin source: Str\nout z: Map<Int>\n\
+             z = dynamic(source: Map<Int>)",
+            BTreeMap::from([
+                (
+                    VarName::new("m"),
+                    vec![
+                        Value::Map(BTreeMap::from([("a".into(), 1.into())])),
+                        Value::NoVal,
+                        Value::Map(BTreeMap::from([("a".into(), 3.into())])),
+                        Value::Map(BTreeMap::from([("a".into(), 4.into())])),
+                    ],
+                ),
+                (
+                    VarName::new("x"),
+                    vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str(expression.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in m: Map<Int>\nin x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        BTreeMap::from([
+            (
+                VarName::new("m"),
+                vec![
+                    Value::Map(BTreeMap::from([("a".into(), 1.into())])),
+                    Value::NoVal,
+                    Value::Map(BTreeMap::from([("a".into(), 3.into())])),
+                    Value::Map(BTreeMap::from([("a".into(), 4.into())])),
+                ],
+            ),
+            (
+                VarName::new("x"),
+                vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+            ),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("Map.get(m, \"a\") + x".into()),
+                    Value::NoVal,
+                    Value::NoVal,
+                    Value::NoVal,
+                ],
+            ),
+        ]),
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_partial_application_parity(executor: Rc<LocalExecutor<'static>>) {
+    for expression in ["partial(\\a: Int, b: Int -> a + b, x)(y)"] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in x: Int\nin y: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), Value::NoVal, 3.into(), 4.into()],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str(expression.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_collection_access_lifting_parity(executor: Rc<LocalExecutor<'static>>) {
+    for expression in [
+        "List.get(xs, index) + x",
+        "List.head(xs) + x",
+        "List.len(xs) + x",
+    ] {
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            "in xs: List<Int>\nin index: Int\nin x: Int\nin source: Str\nout z: Int\n\
+             z = dynamic(source: Int)",
+            BTreeMap::from([
+                (
+                    VarName::new("xs"),
+                    vec![
+                        Value::List(vec![1.into(), 2.into()].into()),
+                        Value::NoVal,
+                        Value::List(vec![3.into(), 4.into()].into()),
+                        Value::List(vec![4.into(), 5.into()].into()),
+                    ],
+                ),
+                (
+                    VarName::new("index"),
+                    vec![0.into(), 1.into(), Value::NoVal, 0.into()],
+                ),
+                (
+                    VarName::new("x"),
+                    vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Str(expression.into()),
+                        Value::NoVal,
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_map_predicate_lifting_parity(executor: Rc<LocalExecutor<'static>>) {
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in m: Map<Int>\nin source: Str\nout z: Bool\nz = dynamic(source: Bool)",
+        BTreeMap::from([
+            (
+                VarName::new("m"),
+                vec![
+                    Value::Map(BTreeMap::from([("a".into(), 1.into())])),
+                    Value::NoVal,
+                    Value::Map(BTreeMap::new()),
+                    Value::NoVal,
+                ],
+            ),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("Map.has_key(m, \"a\")".into()),
+                    Value::NoVal,
+                    Value::NoVal,
+                    Value::NoVal,
+                ],
+            ),
+        ]),
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_stateful_helper_presence_matrix_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for presence_mask in 0_u8..16 {
+        let sparse_ints = |scale: i64| {
+            (0..4)
+                .map(|tick| {
+                    if presence_mask & (1 << tick) == 0 {
+                        Value::NoVal
+                    } else {
+                        Value::Int(scale * i64::from(tick + 1))
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for expression in [
+            "update(x, replacement)",
+            "default(x, replacement)",
+            "init(x, replacement)",
+        ] {
+            assert_dataflow_semisync_runtime_parity(
+                executor.clone(),
+                "in x: Int\nin replacement: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+                BTreeMap::from([
+                    (VarName::new("x"), sparse_ints(1)),
+                    (VarName::new("replacement"), vec![Value::Deferred, 20.into(), Value::NoVal, 40.into()]),
+                    (VarName::new("source"), vec![Value::Str(expression.into()), Value::NoVal, Value::NoVal, Value::NoVal]),
+                ]),
+            ).await;
+        }
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_dynamic_recursive_function_uses_lazy_base_case(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let source = "in n: Int\nin bias: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)";
+    let spec = source.parse::<DsrvSpecification>().unwrap();
+    let rows = eval_dataflow_runtime(
+        executor,
+        spec,
+        BTreeMap::from([
+            (VarName::new("n"), vec![0.into(), 2.into(), Value::NoVal, 1.into()]),
+            (VarName::new("bias"), vec![10.into(), 20.into(), 30.into(), Value::NoVal]),
+            (
+                VarName::new("source"),
+                vec![
+                    Value::Str("fix(\\self: (Int -> Int), k: Int -> if k == 0 then bias else self(k - 1) + 1)(n)".into()),
+                    Value::NoVal,
+                    Value::NoVal,
+                    Value::NoVal,
+                ],
+            ),
+        ]),
+        4,
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            BTreeMap::from([(VarName::new("z"), Value::Int(10))]),
+            BTreeMap::from([(VarName::new("z"), Value::Int(22))]),
+            BTreeMap::from([(VarName::new("z"), Value::Int(32))]),
+            BTreeMap::from([(VarName::new("z"), Value::Int(31))]),
+        ]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_multiple_runtime_compiled_outputs_complete_each_tick(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let spec = "in x: Int\nin y: Int\nin left_source: Str\nin right_source: Str\n\
+         out left: Int\nout right: Int\n\
+         left = dynamic(left_source: Int)\n\
+         right = defer(right_source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let rows = eval_dataflow_runtime(
+        executor,
+        spec,
+        BTreeMap::from([
+            (
+                VarName::new("x"),
+                vec![1.into(), Value::NoVal, 3.into(), 4.into()],
+            ),
+            (
+                VarName::new("y"),
+                vec![10.into(), 20.into(), Value::NoVal, 40.into()],
+            ),
+            (
+                VarName::new("left_source"),
+                vec![
+                    Value::Str("x".into()),
+                    Value::NoVal,
+                    Value::Str("y".into()),
+                    Value::NoVal,
+                ],
+            ),
+            (
+                VarName::new("right_source"),
+                vec![
+                    Value::Deferred,
+                    Value::Str("y".into()),
+                    Value::NoVal,
+                    Value::Deferred,
+                ],
+            ),
+        ]),
+        4,
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            BTreeMap::from([
+                (VarName::new("left"), Value::Int(1)),
+                (VarName::new("right"), Value::Deferred),
+            ]),
+            BTreeMap::from([
+                (VarName::new("left"), Value::Int(1)),
+                (VarName::new("right"), Value::Int(20)),
+            ]),
+            BTreeMap::from([
+                (VarName::new("left"), Value::Int(20)),
+                (VarName::new("right"), Value::Int(20)),
+            ]),
+            BTreeMap::from([
+                (VarName::new("left"), Value::Int(40)),
+                (VarName::new("right"), Value::Int(40)),
+            ]),
+        ]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_computed_property_source_parity(executor: Rc<LocalExecutor<'static>>) {
+    for operator in ["dynamic", "defer"] {
+        let application = if operator == "dynamic" {
+            "dynamic(property: Int, {x, y, property})"
+        } else {
+            "defer(property: Int)"
+        };
+        let spec = format!(
+            "in x: Int\nin y: Int\nin choose: Bool\nin left: Str\nin right: Str\n\
+             out z: Int\naux property: Str\n\
+             property = if choose then left else right\n\
+             z = {application}"
+        );
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            &spec,
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), Value::NoVal, 3.into(), 4.into(), 5.into()],
+                ),
+                (
+                    VarName::new("y"),
+                    vec![10.into(), 20.into(), Value::NoVal, 40.into(), 50.into()],
+                ),
+                (
+                    VarName::new("choose"),
+                    vec![
+                        true.into(),
+                        Value::NoVal,
+                        false.into(),
+                        true.into(),
+                        false.into(),
+                    ],
+                ),
+                (
+                    VarName::new("left"),
+                    vec![
+                        "x".into(),
+                        Value::NoVal,
+                        "x[1]".into(),
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+                (
+                    VarName::new("right"),
+                    vec![
+                        "y".into(),
+                        Value::NoVal,
+                        "y[1]".into(),
+                        Value::NoVal,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_downstream_of_runtime_compiled_output_parity(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    for operator in ["dynamic", "defer"] {
+        let spec = format!(
+            "in x: Int\nin source: Str\nout dynamic_value: Int\nout downstream: Int\n\
+             dynamic_value = {operator}(source: Int)\n\
+             downstream = default(dynamic_value[1], 0) + 1"
+        );
+        assert_dataflow_semisync_runtime_parity(
+            executor.clone(),
+            &spec,
+            BTreeMap::from([
+                (
+                    VarName::new("x"),
+                    vec![1.into(), Value::NoVal, 3.into(), 4.into(), 5.into()],
+                ),
+                (
+                    VarName::new("source"),
+                    vec![
+                        Value::Deferred,
+                        Value::Str("x".into()),
+                        Value::NoVal,
+                        Value::Deferred,
+                        Value::NoVal,
+                    ],
+                ),
+            ]),
+        )
+        .await;
+    }
+}
+
+#[apply(async_test)]
+async fn dataflow_semisync_new_property_uses_current_global_tick(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    assert_dataflow_semisync_runtime_parity(
+        executor,
+        "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)",
+        BTreeMap::from([
+            (VarName::new("x"), vec![1.into(), Value::NoVal, 3.into()]),
+            (
+                VarName::new("source"),
+                vec![Value::Deferred, Value::Str("x".into()), Value::NoVal],
+            ),
+        ]),
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_async_new_property_uses_current_global_tick(
+    executor: Rc<LocalExecutor<'static>>,
+) {
+    let spec = "in x: Int\nin source: Str\nout z: Int\nz = dynamic(source: Int)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let inputs = BTreeMap::from([
+        (VarName::new("x"), vec![1.into(), Value::NoVal, 3.into()]),
+        (
+            VarName::new("source"),
+            vec![Value::Deferred, Value::Str("x".into()), Value::NoVal],
+        ),
+    ]);
+    let dataflow = eval_dataflow_runtime(executor.clone(), spec.clone(), inputs.clone(), 3).await;
+    let asynchronous = eval_runtime_with::<UntimedDsrvSemantics>(executor, spec, inputs, 3).await;
+    assert_eq!(dataflow, asynchronous);
+}
+
+#[apply(async_test)]
+async fn dataflow_matches_sindex_default(executor: Rc<LocalExecutor<'static>>) {
+    assert_matches_current(
+        executor,
+        "default(x[1], 0) + y",
+        vec![
+            ("x", vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()]),
+            (
+                "y",
+                vec![10.into(), 20.into(), 30.into(), 40.into(), 50.into()],
+            ),
+        ],
+    )
+    .await;
+}
+
+#[apply(async_test)]
+async fn dataflow_runtime_matches_recursive_accumulator(executor: Rc<LocalExecutor<'static>>) {
+    let spec = "in x\nout z\nz = default(z[1], 0) + x"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let inputs = BTreeMap::from([(
+        VarName::new("x"),
+        vec![1.into(), 2.into(), 3.into(), 4.into(), 5.into()],
+    )]);
+
+    let expected = eval_runtime_with::<UntimedDsrvSemantics>(
+        executor.clone(),
+        spec.clone(),
+        inputs.clone(),
+        5,
+    )
+    .await;
+    let actual = eval_dataflow_spec(spec, inputs);
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual
+            .iter()
+            .map(|values| values[&VarName::new("z")].clone())
+            .collect::<Vec<_>>(),
+        vec![1.into(), 3.into(), 6.into(), 10.into(), 15.into()]
+    );
+}
+
+#[apply(async_test)]
+async fn dataflow_stateful_lifting_matches_current(executor: Rc<LocalExecutor<'static>>) {
+    let vars = vec![(
+        "x",
+        vec![
+            Value::Int(1),
+            Value::NoVal,
+            Value::Deferred,
+            Value::NoVal,
+            Value::Int(4),
+        ],
+    )];
+
+    for expression in ["default(x, 0)", "is_defined(x)", "when(x)"] {
+        let expected =
+            eval_with::<UntimedDsrvSemantics>(executor.clone(), expression, vars.clone()).await;
+        let actual = eval_dataflow(expression, vars.clone());
+        assert_eq!(actual, expected, "dataflow differed for `{expression}`");
+    }
+}
+
+#[test]
+fn dataflow_lifting_does_not_depend_on_recursive_plan_shape() {
+    let spec = "in x\nout z\nz = if false then z[1] else default(x, 42)"
+        .parse::<DsrvSpecification>()
+        .unwrap();
+    let mut monitor = DataflowMonitor::compile_untyped(spec).unwrap();
+
+    let output = evaluate(
+        &mut monitor,
+        &[vec![
+            Value::Int(1),
+            Value::NoVal,
+            Value::Deferred,
+            Value::NoVal,
+            Value::Int(4),
+        ]],
+    );
+
+    assert_eq!(
+        output,
+        vec![vec![
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(42),
+            Value::Int(42),
+            Value::Int(4),
+        ]]
+    );
+}

@@ -1,0 +1,382 @@
+use std::{collections::BTreeMap, rc::Rc};
+
+// There is a false warning about the import of the ensures macro
+#[allow(unused_imports)]
+use contracts::{ensures, requires};
+#[warn(unused_imports)]
+use tracing::info;
+
+use crate::{
+    Specification, VarName,
+    distributed::distribution_graphs::{LabelledDistributionGraph, NodeName},
+    semantics::distributed::localisation::Localisable,
+};
+
+use super::communication::SchedulerCommunicator;
+
+// TODO: it is somewhat odd that spec is placed here; we need a Knowledge component in the MAPE-K
+// loop
+pub struct SchedulerExecutor<M: Specification + Localisable> {
+    spec: M,
+    var_msg_types: BTreeMap<VarName, String>,
+    topic_mapping: BTreeMap<VarName, String>,
+    communicator: Box<dyn SchedulerCommunicator<M>>,
+    last_node_labels: BTreeMap<NodeName, Vec<VarName>>,
+}
+
+/// Translate the type annotations of a localised spec into ROS types for the work allocation
+#[ensures(ret.as_ref().is_ok()
+    -> {let io_vars: Vec<VarName> = spec
+        .input_vars()
+        .into_iter()
+        .chain(spec.output_vars().into_iter())
+        .collect();
+        ret.as_ref().is_ok_and(move |work| work.type_info.keys().all(|v| io_vars.contains(v)))})]
+fn monitor_work_for_specification<M: Specification + Localisable>(
+    spec: M,
+    var_msg_types: BTreeMap<VarName, String>,
+    topic_mapping: BTreeMap<VarName, String>,
+) -> anyhow::Result<super::communication::MonitorWork<M>> {
+    let io_vars: Vec<VarName> = spec
+        .input_vars()
+        .into_iter()
+        .chain(spec.output_vars().into_iter())
+        .collect();
+
+    let type_info: BTreeMap<VarName, String> = var_msg_types
+        .into_iter()
+        .filter(|(var, _)| io_vars.contains(var))
+        .collect();
+
+    let topic_mapping: BTreeMap<VarName, String> = topic_mapping
+        .into_iter()
+        .filter(|(var, _)| io_vars.contains(var))
+        .collect();
+
+    Ok(super::communication::MonitorWork {
+        // Clone here due to use in contract
+        spec: spec.clone(),
+        type_info,
+        topic_mapping,
+    })
+}
+
+#[requires(local_topics.iter().all(|v| spec.var_names().contains(v) && (spec.aux_vars().contains(v) || var_msg_types.contains_key(v))))]
+#[ensures(ret.as_ref().is_ok() -> {
+    ret.as_ref().is_ok_and(|work| work.spec.output_vars().iter().all(|v| local_topics.contains(v)
+       && (spec.aux_vars().contains(v) || var_msg_types.contains_key(v))))})]
+fn local_monitor_work<M: Specification + Localisable>(
+    spec: M,
+    var_msg_types: BTreeMap<VarName, String>,
+    topic_mapping: BTreeMap<VarName, String>,
+    local_topics: Vec<VarName>,
+) -> anyhow::Result<super::communication::MonitorWork<M>> {
+    let local_spec = spec.localise(&local_topics);
+
+    monitor_work_for_specification(local_spec, var_msg_types.clone(), topic_mapping.clone())
+}
+
+impl<M: Specification + Localisable> SchedulerExecutor<M> {
+    pub fn new(
+        spec: M,
+        var_msg_types: BTreeMap<VarName, String>,
+        topic_mapping: BTreeMap<VarName, String>,
+        communicator: Box<dyn SchedulerCommunicator<M>>,
+    ) -> Self {
+        SchedulerExecutor {
+            spec,
+            var_msg_types,
+            topic_mapping,
+            communicator,
+            last_node_labels: BTreeMap::new(),
+        }
+    }
+
+    pub async fn execute(&mut self, dist_graph: Rc<LabelledDistributionGraph>) {
+        let nodes = dist_graph.dist_graph.graph.node_indices();
+        // is this really the best way?
+        for node in nodes {
+            let node_name = dist_graph.dist_graph.graph[node].clone();
+            let local_topics = dist_graph.node_labels[&node].clone();
+            if self
+                .last_node_labels
+                .get(&node_name)
+                .is_some_and(|last_topics| last_topics == &local_topics)
+            {
+                info!(
+                    "Skipping unchanged work for node {} with local_topics {:?}",
+                    node_name, local_topics
+                );
+                continue;
+            }
+            if !self.last_node_labels.contains_key(&node_name) && local_topics.is_empty() {
+                info!(
+                    "Skipping initial empty work for node {} with local_topics {:?}",
+                    node_name, local_topics
+                );
+                self.last_node_labels.insert(node_name, local_topics);
+                continue;
+            }
+            let work = local_monitor_work(
+                self.spec.clone(),
+                self.var_msg_types.clone(),
+                self.topic_mapping.clone(),
+                local_topics.clone(),
+            )
+            .expect("Failed to get local work assignment from specification");
+            info!(
+                "Scheduling work {:?} for node {} with local_topics {:?}",
+                work, node_name, local_topics
+            );
+            self.communicator
+                .schedule_work(node_name.clone(), work)
+                .await
+                .expect("Failed to schedule work");
+            self.last_node_labels.insert(node_name, local_topics);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DsrvSpecification;
+    use crate::distributed::distribution_graphs::{DistributionGraph, LabelledDistributionGraph};
+    use crate::distributed::scheduling::communication::{MockSchedulerCommunicator, WorkTypeInfo};
+    use crate::semantics::distributed::localisation::Localisable;
+    use macro_rules_attribute::apply;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn monitor_work_keeps_only_localised_io_type_info() -> anyhow::Result<()> {
+        let spec_src = "in x: Int\nin z: Int\nout y: Int\ny = (x + 1)";
+        let spec = (spec_src)
+            .parse::<DsrvSpecification>()
+            .expect("test DSRV specification should parse");
+        let local_spec = spec.localise(&vec!["y".into()]);
+
+        let var_msg_types: WorkTypeInfo = BTreeMap::from([
+            ("x".into(), "Int32".to_string()),
+            ("y".into(), "Int32".to_string()),
+            ("z".into(), "Int32".to_string()),
+            ("unused".into(), "Int32".to_string()),
+        ]);
+
+        let topic_mapping: BTreeMap<VarName, String> = BTreeMap::from([
+            ("x".into(), "/x".to_string()),
+            ("y".into(), "/y".to_string()),
+            ("z".into(), "/z".to_string()),
+            ("unused".into(), "/unused".to_string()),
+        ]);
+
+        let work = monitor_work_for_specification(local_spec, var_msg_types, topic_mapping)?;
+
+        assert!(work.type_info.contains_key(&"x".into()));
+        assert!(work.type_info.contains_key(&"y".into()));
+        assert!(!work.type_info.contains_key(&"z".into()));
+        assert!(!work.type_info.contains_key(&"unused".into()));
+        Ok(())
+    }
+
+    #[apply(crate::async_test)]
+    async fn scheduler_executor_sends_io_type_info_per_node(
+        _executor: Rc<smol::LocalExecutor<'static>>,
+    ) -> anyhow::Result<()> {
+        let spec_src = "in x: Int\nin z: Int\nout y: Int\ny = (x + 1)";
+        let spec = (spec_src)
+            .parse::<DsrvSpecification>()
+            .expect("test DSRV specification should parse");
+
+        let var_msg_types: WorkTypeInfo = BTreeMap::from([
+            ("x".into(), "Int32".to_string()),
+            ("y".into(), "Int32".to_string()),
+            ("z".into(), "Int32".to_string()),
+            ("unused".into(), "Int32".to_string()),
+        ]);
+
+        let mut graph = petgraph::prelude::DiGraph::new();
+        let node_a = graph.add_node("A".into());
+        let dist_graph = DistributionGraph {
+            central_monitor: node_a,
+            graph,
+        };
+        let labelled = LabelledDistributionGraph {
+            dist_graph: Rc::new(dist_graph),
+            var_names: vec!["x".into(), "y".into(), "z".into()],
+            node_labels: BTreeMap::from([(node_a, vec!["y".into()])]),
+        };
+
+        let communicator = Arc::new(Mutex::new(MockSchedulerCommunicator::<DsrvSpecification> {
+            log: vec![],
+        }));
+        let topic_mapping: BTreeMap<VarName, String> = BTreeMap::from([
+            ("x".into(), "/x".to_string()),
+            ("y".into(), "/y".to_string()),
+            ("z".into(), "/z".to_string()),
+            ("unused".into(), "/unused".to_string()),
+        ]);
+
+        let mut executor = SchedulerExecutor::new(
+            spec,
+            var_msg_types,
+            topic_mapping,
+            Box::new(communicator.clone()) as Box<dyn SchedulerCommunicator<_>>,
+        );
+
+        executor.execute(Rc::new(labelled)).await;
+
+        let lock = communicator.lock().unwrap();
+        assert_eq!(lock.log.len(), 1);
+
+        let (_node, work) = &lock.log[0];
+        assert!(work.type_info.contains_key(&"x".into()));
+        assert!(work.type_info.contains_key(&"y".into()));
+        assert!(!work.type_info.contains_key(&"z".into()));
+        assert!(!work.type_info.contains_key(&"unused".into()));
+        Ok(())
+    }
+
+    #[apply(crate::async_test)]
+    async fn scheduler_executor_propagates_ros_topic_mapping_per_node(
+        _executor: Rc<smol::LocalExecutor<'static>>,
+    ) -> anyhow::Result<()> {
+        let spec_src = "in x: Int\nin z: Int\nout y: Int\ny = (x + 1)";
+        let spec = (spec_src)
+            .parse::<DsrvSpecification>()
+            .expect("test DSRV specification should parse");
+
+        let var_msg_types: WorkTypeInfo = BTreeMap::from([
+            ("x".into(), "Int32".to_string()),
+            ("y".into(), "Int32".to_string()),
+            ("z".into(), "Int32".to_string()),
+            ("unused".into(), "Int32".to_string()),
+        ]);
+
+        let topic_mapping: BTreeMap<VarName, String> = BTreeMap::from([
+            ("x".into(), "/robot_1/in/x".to_string()),
+            ("y".into(), "/robot_1/out/y".to_string()),
+            ("z".into(), "/robot_1/in/z".to_string()),
+            ("unused".into(), "/robot_1/unused".to_string()),
+        ]);
+
+        let mut graph = petgraph::prelude::DiGraph::new();
+        let node_a = graph.add_node("A".into());
+        let dist_graph = DistributionGraph {
+            central_monitor: node_a,
+            graph,
+        };
+        let labelled = LabelledDistributionGraph {
+            dist_graph: Rc::new(dist_graph),
+            var_names: vec!["x".into(), "y".into(), "z".into()],
+            node_labels: BTreeMap::from([(node_a, vec!["y".into()])]),
+        };
+
+        let communicator = Arc::new(Mutex::new(MockSchedulerCommunicator::<DsrvSpecification> {
+            log: vec![],
+        }));
+        let mut executor = SchedulerExecutor::new(
+            spec,
+            var_msg_types,
+            topic_mapping,
+            Box::new(communicator.clone()) as Box<dyn SchedulerCommunicator<_>>,
+        );
+
+        executor.execute(Rc::new(labelled)).await;
+
+        let lock = communicator.lock().unwrap();
+        assert_eq!(lock.log.len(), 1);
+
+        let (_node, work) = &lock.log[0];
+
+        assert_eq!(
+            work.topic_mapping
+                .get(&VarName::from("x"))
+                .map(String::as_str),
+            Some("/robot_1/in/x")
+        );
+        assert_eq!(
+            work.topic_mapping
+                .get(&VarName::from("y"))
+                .map(String::as_str),
+            Some("/robot_1/out/y")
+        );
+        assert!(!work.topic_mapping.contains_key(&VarName::from("z")));
+        assert!(!work.topic_mapping.contains_key(&VarName::from("unused")));
+
+        Ok(())
+    }
+
+    #[apply(crate::async_test)]
+    async fn scheduler_executor_skips_only_initial_empty_work(
+        _executor: Rc<smol::LocalExecutor<'static>>,
+    ) -> anyhow::Result<()> {
+        let spec_src = "in x: Int\nout y: Int\ny = (x + 1)";
+        let spec = (spec_src)
+            .parse::<DsrvSpecification>()
+            .expect("test DSRV specification should parse");
+
+        let var_msg_types: WorkTypeInfo = BTreeMap::from([
+            ("x".into(), "Int32".to_string()),
+            ("y".into(), "Int32".to_string()),
+        ]);
+        let topic_mapping: BTreeMap<VarName, String> = BTreeMap::from([
+            ("x".into(), "/x".to_string()),
+            ("y".into(), "/y".to_string()),
+        ]);
+
+        let mut graph = petgraph::prelude::DiGraph::new();
+        let node_a = graph.add_node("A".into());
+        let node_b = graph.add_node("B".into());
+        let dist_graph = Rc::new(DistributionGraph {
+            central_monitor: node_a,
+            graph,
+        });
+        let initial_labelled = LabelledDistributionGraph {
+            dist_graph: dist_graph.clone(),
+            var_names: vec!["y".into()],
+            node_labels: BTreeMap::from([(node_a, vec![]), (node_b, vec!["y".into()])]),
+        };
+        let updated_labelled = LabelledDistributionGraph {
+            dist_graph,
+            var_names: vec!["y".into()],
+            node_labels: BTreeMap::from([(node_a, vec!["y".into()]), (node_b, vec![])]),
+        };
+
+        let communicator = Arc::new(Mutex::new(MockSchedulerCommunicator::<DsrvSpecification> {
+            log: vec![],
+        }));
+        let mut executor = SchedulerExecutor::new(
+            spec,
+            var_msg_types,
+            topic_mapping,
+            Box::new(communicator.clone()) as Box<dyn SchedulerCommunicator<_>>,
+        );
+
+        executor.execute(Rc::new(initial_labelled)).await;
+
+        {
+            let lock = communicator.lock().unwrap();
+            assert_eq!(lock.log.len(), 1);
+            assert_eq!(lock.log[0].0, NodeName::from("B"));
+            assert_eq!(
+                lock.log[0].1.spec.output_vars(),
+                &BTreeSet::from([VarName::from("y")])
+            );
+        }
+
+        executor.execute(Rc::new(updated_labelled)).await;
+
+        let lock = communicator.lock().unwrap();
+        assert_eq!(lock.log.len(), 3);
+        assert_eq!(lock.log[1].0, NodeName::from("A"));
+        assert_eq!(
+            lock.log[1].1.spec.output_vars(),
+            &BTreeSet::from([VarName::from("y")])
+        );
+        assert_eq!(lock.log[2].0, NodeName::from("B"));
+        assert!(lock.log[2].1.spec.output_vars().is_empty());
+
+        Ok(())
+    }
+}
