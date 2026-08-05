@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 375" role="img" aria-labelledby="environment-arrow-title environment-arrow-desc" style="width:100%;max-width:960px;height:auto;background:#ffffff;border:1px solid #d0d7de;border-radius:6px">
+<title id="environment-arrow-title">Stable environment slots and output projection</title>
+<desc id="environment-arrow-desc">Input and computed values occupy stable EnvironmentSlot indices. The scheduler may change stream evaluation order without moving evaluator state, while output slots continue to project alert, total, and scaled from slots three, two, and one.</desc>
+<defs>
+  <marker id="environment-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#65758b"/>
+  </marker>
+</defs>
+<text x="24" y="27" text-anchor="start" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#17212b">Stable EnvironmentSlot layout (tick 2)</text>
+<text x="35" y="62" text-anchor="start" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="#17212b">producers</text>
+<text x="360" y="62" text-anchor="start" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="#17212b">environment_values</text>
+<text x="735" y="62" text-anchor="start" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="#17212b">output projection</text>
+<rect x="35" y="82" width="235" height="44" rx="5" fill="#e8f1fb" stroke="#2563a6" stroke-width="1.5"/>
+<text x="152" y="109" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">input[0]: x = 8</text>
+<rect x="360" y="82" width="275" height="44" rx="5" fill="#e8f1fb" stroke="#2563a6" stroke-width="1.5"/>
+<text x="497" y="109" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">EnvironmentSlot(0): x = 8</text>
+<line x1="270" y1="104" x2="360" y2="104" stroke="#65758b" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<rect x="35" y="142" width="235" height="44" rx="5" fill="#e6f5f0" stroke="#147d64" stroke-width="1.5"/>
+<text x="152" y="169" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">scaled -&gt; 16</text>
+<rect x="360" y="142" width="275" height="44" rx="5" fill="#e6f5f0" stroke="#147d64" stroke-width="1.5"/>
+<text x="497" y="169" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">EnvironmentSlot(1): scaled = 16</text>
+<line x1="270" y1="164" x2="360" y2="164" stroke="#65758b" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<rect x="35" y="202" width="235" height="44" rx="5" fill="#fff1e6" stroke="#b54708" stroke-width="1.5"/>
+<text x="152" y="229" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">total -&gt; 24</text>
+<rect x="360" y="202" width="275" height="44" rx="5" fill="#fff1e6" stroke="#b54708" stroke-width="1.5"/>
+<text x="497" y="229" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">EnvironmentSlot(2): total = 24</text>
+<line x1="270" y1="224" x2="360" y2="224" stroke="#65758b" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<rect x="35" y="262" width="235" height="44" rx="5" fill="#f3ebf8" stroke="#8055a3" stroke-width="1.5"/>
+<text x="152" y="289" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">alert -&gt; true</text>
+<rect x="360" y="262" width="275" height="44" rx="5" fill="#f3ebf8" stroke="#8055a3" stroke-width="1.5"/>
+<text x="497" y="289" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">EnvironmentSlot(3): alert = true</text>
+<line x1="270" y1="284" x2="360" y2="284" stroke="#65758b" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<rect x="735" y="82" width="190" height="44" rx="5" fill="#f3ebf8" stroke="#8055a3" stroke-width="1.5"/>
+<text x="830" y="109" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">output[0]: alert</text>
+<path d="M 635 284 C 685 284, 685 104, 735 104" fill="none" stroke="#8055a3" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<rect x="735" y="172" width="190" height="44" rx="5" fill="#fff1e6" stroke="#b54708" stroke-width="1.5"/>
+<text x="830" y="199" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">output[1]: total</text>
+<path d="M 635 224 C 685 224, 685 194, 735 194" fill="none" stroke="#b54708" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<rect x="735" y="262" width="190" height="44" rx="5" fill="#e6f5f0" stroke="#147d64" stroke-width="1.5"/>
+<text x="830" y="289" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">output[2]: scaled</text>
+<path d="M 635 164 C 685 164, 685 284, 735 284" fill="none" stroke="#147d64" stroke-width="1.8" marker-end="url(#environment-arrow)"/>
+<text x="35" y="346" text-anchor="start" font-family="system-ui, sans-serif" font-size="12" font-weight="400" fill="#52606d">The scheduler may reorder stream evaluation; state and slots do not move</text>
+<text x="735" y="346" text-anchor="start" font-family="ui-monospace, monospace" font-size="13" font-weight="600" fill="#17212b">output slots = [3, 2, 1]</text>
+</svg>

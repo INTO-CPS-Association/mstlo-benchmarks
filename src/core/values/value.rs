@@ -1,0 +1,1278 @@
+use std::{any::Any, collections::BTreeMap, fmt::Debug, fmt::Display, rc::Rc};
+
+use anyhow::anyhow;
+use ecow::{EcoString, EcoVec};
+
+use redis::{FromRedisValue, ToRedisArgs, ToSingleRedisArg};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+use serde_json::Value as JValue;
+use std::fmt;
+
+use super::super::OutputStream;
+
+pub type RuntimeFunctionCallable =
+    Rc<dyn Fn(EcoVec<Value>) -> anyhow::Result<OutputStream<Value>> + 'static>;
+pub type RuntimeFunctionValueCallable =
+    Rc<dyn Fn(EcoVec<Value>) -> anyhow::Result<Value> + 'static>;
+pub type RuntimeFunctionValueFactory = Rc<dyn Fn() -> RuntimeFunctionValueCallable + 'static>;
+
+/// A cheaply cloned handle to a function definition.
+///
+/// Keeping the implementation behind one pointer prevents the function variant from enlarging
+/// every [`Value`]. The shared allocation also provides stable definition identity.
+#[derive(Clone)]
+pub struct RuntimeFunction {
+    inner: Rc<RuntimeFunctionInner>,
+}
+
+#[derive(Clone)]
+struct RuntimeFunctionInner {
+    display: EcoString,
+    callable: Option<RuntimeFunctionCallable>,
+    value_callable: Option<RuntimeFunctionValueCallable>,
+    value_factory: Option<RuntimeFunctionValueFactory>,
+    call_site_stateful: bool,
+    language_payload: Option<Rc<dyn Any>>,
+}
+
+impl RuntimeFunction {
+    pub fn opaque(display: impl Into<EcoString>) -> Self {
+        Self {
+            inner: Rc::new(RuntimeFunctionInner {
+                display: display.into(),
+                callable: None,
+                value_callable: None,
+                value_factory: None,
+                call_site_stateful: false,
+                language_payload: None,
+            }),
+        }
+    }
+
+    pub fn native(
+        display: impl Into<EcoString>,
+        callable: impl Fn(EcoVec<Value>) -> anyhow::Result<OutputStream<Value>> + 'static,
+    ) -> Self {
+        Self {
+            inner: Rc::new(RuntimeFunctionInner {
+                display: display.into(),
+                callable: Some(Rc::new(callable)),
+                value_callable: None,
+                value_factory: None,
+                call_site_stateful: false,
+                language_payload: None,
+            }),
+        }
+    }
+
+    pub fn native_value(
+        display: impl Into<EcoString>,
+        callable: impl Fn(EcoVec<Value>) -> anyhow::Result<Value> + 'static,
+    ) -> Self {
+        let callable: RuntimeFunctionValueCallable = Rc::new(callable);
+        let stream_callable = callable.clone();
+        Self {
+            inner: Rc::new(RuntimeFunctionInner {
+                display: display.into(),
+                callable: Some(Rc::new(move |args| {
+                    let value = stream_callable(args)?;
+                    Ok(Box::pin(futures::stream::iter(vec![value])) as OutputStream<Value>)
+                })),
+                value_callable: Some(callable.clone()),
+                value_factory: Some(Rc::new(move || callable.clone())),
+                call_site_stateful: false,
+                language_payload: None,
+            }),
+        }
+    }
+
+    /// Construct a function whose mutable execution state belongs to each call site.
+    pub(crate) fn value_factory(
+        display: impl Into<EcoString>,
+        call_site_stateful: bool,
+        factory: impl Fn() -> RuntimeFunctionValueCallable + 'static,
+    ) -> Self {
+        Self {
+            inner: Rc::new(RuntimeFunctionInner {
+                display: display.into(),
+                callable: None,
+                value_callable: None,
+                value_factory: Some(Rc::new(factory)),
+                call_site_stateful,
+                language_payload: None,
+            }),
+        }
+    }
+
+    pub(crate) fn with_language_payload<T: Any>(mut self, payload: Rc<T>) -> Self {
+        Rc::make_mut(&mut self.inner).language_payload = Some(payload);
+        self
+    }
+
+    pub(crate) fn language_payload<T: Any>(&self) -> Option<Rc<T>> {
+        Rc::clone(self.inner.language_payload.as_ref()?)
+            .downcast()
+            .ok()
+    }
+
+    pub fn display_source(&self) -> &EcoString {
+        &self.inner.display
+    }
+
+    pub fn call(&self, args: EcoVec<Value>) -> anyhow::Result<OutputStream<Value>> {
+        let Some(callable) = &self.inner.callable else {
+            return Err(anyhow!(
+                "Function {} is display-only and cannot be called",
+                self.inner.display
+            ));
+        };
+        callable(args)
+    }
+
+    pub fn call_value(&self, args: EcoVec<Value>) -> anyhow::Result<Value> {
+        let Some(callable) = &self.inner.value_callable else {
+            return Err(anyhow!(
+                "Function {} has no direct value callable",
+                self.inner.display
+            ));
+        };
+        callable(args)
+    }
+
+    pub fn has_value_callable(&self) -> bool {
+        self.inner.value_callable.is_some()
+    }
+
+    pub(crate) fn supports_value_calls(&self) -> bool {
+        self.inner.value_callable.is_some() || self.inner.value_factory.is_some()
+    }
+
+    pub(crate) fn instantiate_value(&self) -> Option<RuntimeFunctionValueCallable> {
+        self.inner.value_factory.as_ref().map(|factory| factory())
+    }
+
+    pub(crate) fn same_definition(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn requires_call_site_instance(&self) -> bool {
+        self.inner.call_site_stateful
+    }
+
+    pub fn is_callable(&self) -> bool {
+        self.inner.callable.is_some()
+            || self.inner.value_callable.is_some()
+            || self.inner.value_factory.is_some()
+    }
+}
+
+impl Debug for RuntimeFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeFunction")
+            .field("display", &self.inner.display)
+            .field("callable", &self.inner.callable.is_some())
+            .field("value_callable", &self.inner.value_callable.is_some())
+            .field("value_factory", &self.inner.value_factory.is_some())
+            .field("call_site_stateful", &self.inner.call_site_stateful)
+            .field("language_payload", &self.inner.language_payload.is_some())
+            .finish()
+    }
+}
+
+impl Display for RuntimeFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.inner.display)
+    }
+}
+
+impl PartialEq for RuntimeFunction {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_definition(other)
+    }
+}
+
+// Anything inside a stream should be clonable in O(1) time in order for the
+// runtimes to be efficiently implemented. This is why we use EcoString and
+// EcoVec instead of String and Vec. These types are essentially references
+// which allow mutation in place if there is only one reference to the data or
+// copy-on-write if there is more than one reference.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Str(EcoString),
+    Bool(bool),
+    Function(RuntimeFunction),
+    List(EcoVec<Value>),
+    Tuple(EcoVec<Value>),
+    Map(BTreeMap<EcoString, Value>),
+    Unit,     // Indicates the absence of a value
+    Deferred, // Indicates a value that cannot yet be computed due to lack of history
+    NoVal,    // Indicates no value for the current stream step (due to async stream inputs)
+}
+
+impl StreamData for Value {
+    fn is_no_val(&self) -> bool {
+        matches!(self, Value::NoVal)
+    }
+}
+impl DeferrableStreamData for Value {
+    fn is_deferred(&self) -> bool {
+        matches!(self, Value::Deferred)
+    }
+    fn deferred_value() -> Self {
+        Value::Deferred
+    }
+    fn no_val_value() -> Self {
+        Value::NoVal
+    }
+}
+
+impl ToRedisArgs for Value {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + redis::RedisWrite,
+    {
+        match serde_json5::to_string(self) {
+            Ok(json_str) => json_str.write_redis_args(out),
+            Err(_) => "null".write_redis_args(out),
+        }
+    }
+}
+
+// Note: Redis docs say: "This should be implemented only for types that are
+// serialized into exactly one value, otherwise the compiler can't ensure
+// the correctness of some commands."
+// This currently holds for the implementation of Value, but we should keep an eye out.
+impl ToSingleRedisArg for Value {}
+
+impl FromRedisValue for Value {
+    fn from_redis_value(v: redis::Value) -> Result<Self, redis::ParsingError> {
+        match v {
+            redis::Value::BulkString(bytes) => {
+                let s = std::str::from_utf8(&bytes).map_err(|e| {
+                    redis::ParsingError::from(format!("Invalid UTF-8 in BulkString: {:?}", e))
+                })?;
+
+                serde_json5::from_str(s).map_err(|e| {
+                    redis::ParsingError::from(format!(
+                        "BulkString not deserializable to Value with serde_json5: {}",
+                        e
+                    ))
+                })
+            }
+            redis::Value::Array(values) => {
+                let list: Result<Vec<Value>, _> =
+                    values.iter().map(Value::from_redis_value_ref).collect();
+                Ok(Value::List(list?.into()))
+            }
+            redis::Value::Nil => Ok(Value::Unit),
+            redis::Value::Int(i) => Ok(Value::Int(i)),
+            redis::Value::SimpleString(s) => Ok(Value::Str(s.clone().into())),
+            _ => Err(redis::ParsingError::from(std::format!(
+                "Unsupported Redis value type for Value deserialization: {:?}",
+                v
+            ))),
+        }
+    }
+}
+
+impl TryFrom<Value> for i64 {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Int(i) => Ok(i),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<Value> for f64 {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Float(x) => Ok(x),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<Value> for String {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Str(i) => Ok(i.to_string()),
+            Value::Function(i) => Ok(i.display_source().to_string()),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<Value> for bool {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Bool(i) => Ok(i),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<Value> for EcoVec<Value> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::List(i) | Value::Tuple(i) => Ok(i),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<Value> for () {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Unit => Ok(()),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<JValue> for Value {
+    type Error = anyhow::Error;
+
+    fn try_from(value: JValue) -> Result<Self, Self::Error> {
+        match value {
+            JValue::Null => Ok(Value::Unit),
+            JValue::Bool(val) => Ok(Value::Bool(val)),
+            JValue::Number(num) => {
+                if num.is_i64() {
+                    Ok(Value::Int(num.as_i64().unwrap()))
+                } else if num.is_u64() {
+                    Err(anyhow!("u64 too large for Value::Int"))
+                } else {
+                    // Guaranteed to be f64 at this point
+                    Ok(Value::Float(num.as_f64().unwrap()))
+                }
+            }
+            JValue::String(val) => Ok(Value::Str(val.into())),
+            // If any element returns Err then this propagates it (because of collect)
+            JValue::Array(vals) => vals
+                .iter()
+                .map(|v| v.clone().try_into())
+                .collect::<Result<EcoVec<Value>, Self::Error>>()
+                .map(Value::List),
+            JValue::Object(vals) => {
+                // Convert JValue::Object to Value::Map
+                let btree = vals
+                    .iter()
+                    .map(|(k, v)| {
+                        let x = v.clone().try_into()?;
+                        Ok((k.clone().into(), x))
+                    })
+                    .collect::<Result<BTreeMap<EcoString, Value>, Self::Error>>()?;
+                Ok(Value::Map(btree))
+            }
+        }
+    }
+}
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Value::Int(value)
+    }
+}
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Value::Float(value)
+    }
+}
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Value::Str(value.into())
+    }
+}
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Value::Str(value.into())
+    }
+}
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Value::Bool(value)
+    }
+}
+impl From<EcoVec<Value>> for Value {
+    fn from(value: EcoVec<Value>) -> Self {
+        Value::List(value)
+    }
+}
+impl From<Vec<Value>> for Value {
+    fn from(value: Vec<Value>) -> Self {
+        Value::List(value.into()) // Into = from Vec -> EcoVec
+    }
+}
+impl From<BTreeMap<EcoString, Value>> for Value {
+    fn from(value: BTreeMap<EcoString, Value>) -> Self {
+        Value::Map(value)
+    }
+}
+impl From<()> for Value {
+    fn from(_value: ()) -> Self {
+        Value::Unit
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(i) => write!(f, "{}", i),
+            Value::Float(fl) if fl.is_finite() && fl.fract() == 0.0 => write!(f, "{fl:.1}"),
+            Value::Float(fl) => write!(f, "{}", fl),
+            Value::Str(s) => write!(f, "{:?}", s),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Function(function) => write!(f, "{}", function.display_source()),
+            Value::List(vals) => {
+                let vals = vals
+                    .iter()
+                    .map(|val| format!("{}", val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "[{}]", vals)
+            }
+            Value::Tuple(vals) => {
+                let vals = vals
+                    .iter()
+                    .map(|val| format!("{}", val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Tuple({})", vals)
+            }
+            Value::Map(map) => {
+                let entries = map
+                    .iter()
+                    .map(|(key, val)| format!("{:?}: {}", key, val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Map({})", entries)
+            }
+            Value::Deferred => write!(f, "⊥"),
+            Value::NoVal => write!(f, "no_val"),
+            Value::Unit => write!(f, "()"),
+        }
+    }
+}
+
+/* Trait for the values being sent along streams. This could be just Value for
+ * untimed heterogeneous streams, more specific types for homogeneous (typed)
+ * streams, or time-stamped values for timed streams. This traits allows
+ * for the implementation of runtimes to be agnostic of the types of stream
+ * values used. */
+pub trait StreamData: Clone + Debug + 'static {
+    fn is_no_val(&self) -> bool {
+        false
+    }
+}
+
+/* Trait for stream data with a statically known stream type */
+pub trait TypedStreamData: StreamData {
+    fn stream_data_type() -> StreamType;
+}
+
+/* Trait for stream data types that can represent deferred values as a placeholder
+* for when an expression cannot be computed due to a lack of context */
+pub trait DeferrableStreamData: StreamData {
+    fn is_deferred(&self) -> bool;
+    fn deferred_value() -> Self;
+    fn no_val_value() -> Self;
+}
+
+// Trait defining the allowed types for expression values
+impl StreamData for i64 {}
+impl StreamData for i32 {}
+impl StreamData for u64 {}
+impl StreamData for f64 {}
+impl StreamData for String {}
+impl StreamData for bool {}
+impl StreamData for () {}
+impl StreamData for EcoVec<Value> {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum StreamType {
+    Int,
+    Float,
+    Str,
+    Bool,
+    Unit,
+    List(Box<StreamType>),
+    Tuple(EcoVec<StreamType>),
+    Map(Box<StreamType>),
+    Struct(EcoVec<(EcoString, StreamType)>, bool), // ordered typed fields, true allows extra fields
+    Function(EcoVec<StreamType>, Box<StreamType>),
+    /// Gradual/dynamic stream type. Values are represented as `Value` and checked at runtime when
+    /// cast to a stricter type.
+    Any,
+}
+
+impl Display for StreamType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamType::Int => write!(f, "Int"),
+            StreamType::Float => write!(f, "Float"),
+            StreamType::Str => write!(f, "Str"),
+            StreamType::Bool => write!(f, "Bool"),
+            StreamType::Unit => write!(f, "Unit"),
+            StreamType::List(inner) => write!(f, "List<{}>", inner),
+            StreamType::Tuple(inner) => {
+                let len = inner.len();
+                let inner = inner
+                    .iter()
+                    .map(|typ| format!("{}", typ))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if len == 1 {
+                    write!(f, "({},)", inner)
+                } else {
+                    write!(f, "({})", inner)
+                }
+            }
+            StreamType::Map(inner) => write!(f, "Map<{}>", inner),
+            StreamType::Struct(inner, allow_extra) => {
+                let mut fields = inner
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .collect::<Vec<_>>();
+                if *allow_extra {
+                    fields.push("...".into());
+                }
+                write!(f, "Struct<{}>", fields.join(", "))
+            }
+            StreamType::Function(args, ret) => {
+                let args = args
+                    .iter()
+                    .map(|arg| format!("{}", arg))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "({} -> {})", args, ret)
+            }
+            StreamType::Any => write!(f, "Any"),
+        }
+    }
+}
+
+impl TypedStreamData for i64 {
+    fn stream_data_type() -> StreamType {
+        StreamType::Int
+    }
+}
+
+impl TypedStreamData for u64 {
+    fn stream_data_type() -> StreamType {
+        StreamType::Int
+    }
+}
+
+impl TypedStreamData for f64 {
+    fn stream_data_type() -> StreamType {
+        StreamType::Float
+    }
+}
+
+impl TypedStreamData for String {
+    fn stream_data_type() -> StreamType {
+        StreamType::Str
+    }
+}
+
+impl TypedStreamData for bool {
+    fn stream_data_type() -> StreamType {
+        StreamType::Bool
+    }
+}
+
+impl TypedStreamData for () {
+    fn stream_data_type() -> StreamType {
+        StreamType::Unit
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum StreamTypeAscription {
+    Ascribed(StreamType),
+    Unascribed,
+}
+
+impl Serialize for Value {
+    // Certain edge cases were not covered by derived Serialize, such as serializing List
+    // symmetrically, hence manual impl
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            // Should never need to serialize a NoVal, since it indicates no value received
+            Value::NoVal => Err(serde::ser::Error::custom("Cannot serialize Value::NoVal")),
+
+            Value::Unit => serializer.serialize_none(),
+
+            Value::Deferred => serializer.serialize_str("⊥"),
+
+            Value::Bool(b) => serializer.serialize_bool(*b),
+
+            Value::Int(i) => serializer.serialize_i64(*i),
+
+            Value::Float(f) => serializer.serialize_f64(*f),
+
+            Value::Str(s) => serializer.serialize_str(s),
+
+            Value::Function(function) => serializer.serialize_str(function.display_source()),
+
+            Value::List(vals) | Value::Tuple(vals) => {
+                let mut seq = serializer.serialize_seq(Some(vals.len()))?;
+                for v in vals.iter() {
+                    seq.serialize_element(v)?;
+                }
+                seq.end()
+            }
+            Value::Map(map) => {
+                let mut m = serializer.serialize_map(Some(map.len()))?;
+                for (k, v) in map.iter() {
+                    m.serialize_entry(k, v)?;
+                }
+                m.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Value {
+    // Certain edge cases were not covered by derived Serialize, such as handling Deferred
+    // symmetrically, hence manual impl
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueVisitor;
+
+        impl<'de> Visitor<'de> for ValueVisitor {
+            type Value = Value;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "any valid JSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+                Ok(Value::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+                Ok(Value::Int(v))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Value, E>
+            where
+                E: de::Error,
+            {
+                // clamp or reject: here we reject if > i64::MAX
+                if v <= i64::MAX as u64 {
+                    Ok(Value::Int(v as i64))
+                } else {
+                    Err(E::custom("u64 too large for Value::Int"))
+                }
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+                Ok(Value::Float(v))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+                if v == "⊥" {
+                    Ok(Value::Deferred)
+                } else {
+                    Ok(Value::Str(v.into()))
+                }
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Value, E> {
+                if v == "⊥" {
+                    Ok(Value::Deferred)
+                } else {
+                    Ok(Value::Str(v.into()))
+                }
+            }
+
+            fn visit_none<E>(self) -> Result<Value, E> {
+                Ok(Value::Unit)
+            }
+
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Unit)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut vals = EcoVec::new();
+                while let Some(elem) = seq.next_element()? {
+                    vals.push(elem);
+                }
+                Ok(Value::List(vals))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = BTreeMap::new();
+                while let Some((k, v)) = map.next_entry::<String, Value>()? {
+                    out.insert(k.into(), v);
+                }
+                Ok(Value::Map(out))
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use serde_json::{json, to_value};
+    use serde_json5::{from_str, to_string};
+
+    #[test]
+    fn test_json_try_into_null() {
+        let jv = json!(null);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Unit);
+    }
+
+    #[test]
+    fn test_json_try_into_bool() {
+        let jv = json!(true);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_json_try_into_int() {
+        let jv = json!(42);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn test_json_try_into_float() {
+        let jv = json!(3.14);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Float(3.14));
+    }
+
+    #[test]
+    fn test_json_try_into_string() {
+        let jv = json!("hello");
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Str("hello".into()));
+    }
+
+    #[test]
+    fn test_json_try_into_array() {
+        let jv = json!([1, 2, 3]);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(
+            v,
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into())
+        );
+    }
+
+    #[test]
+    fn test_json_try_into_object() {
+        let jv = json!({
+            "x": 42,
+            "y": true,
+            "z": "hello"
+        });
+        let v: Value = jv.try_into().unwrap();
+
+        let mut expected = BTreeMap::new();
+        expected.insert("x".into(), Value::Int(42));
+        expected.insert("y".into(), Value::Bool(true));
+        expected.insert("z".into(), Value::Str("hello".into()));
+
+        assert_eq!(v, Value::Map(expected));
+    }
+
+    #[test]
+    fn test_json_try_into_nested() {
+        let jv = json!({
+            "nums": [1, 2, 3],
+            "nested": { "a": false }
+        });
+        let v: Value = jv.try_into().unwrap();
+
+        let mut nested = BTreeMap::new();
+        nested.insert("a".into(), Value::Bool(false));
+
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "nums".into(),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into()),
+        );
+        expected.insert("nested".into(), Value::Map(nested));
+
+        assert_eq!(v, Value::Map(expected));
+    }
+
+    #[test]
+    fn test_json_try_into_too_large_number() {
+        let jv = serde_json::Value::Number(serde_json::Number::from(u64::MAX));
+        let result: Result<Value, _> = jv.try_into();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_json_try_into_empty_string() {
+        let jv = json!("");
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Str("".into()));
+    }
+
+    #[test]
+    fn test_json_try_into_unicode_string() {
+        let jv = json!("こんにちは🌏");
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Str("こんにちは🌏".into()));
+    }
+
+    #[test]
+    fn test_json_try_into_large_int_bounds() {
+        let jv = json!(i64::MAX);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Int(i64::MAX));
+
+        let jv = serde_json::json!(i64::MIN);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Int(i64::MIN));
+    }
+
+    #[test]
+    fn test_json_try_into_empty_array() {
+        let jv = json!([]);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::List(vec![].into()));
+    }
+
+    #[test]
+    fn test_json_try_into_mixed_array() {
+        let jv = json!([1, "two", false]);
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(
+            v,
+            Value::List(vec![Value::Int(1), Value::Str("two".into()), Value::Bool(false)].into())
+        );
+    }
+
+    #[test]
+    fn test_json_try_into_empty_object() {
+        let jv = json!({});
+        let v: Value = jv.try_into().unwrap();
+        assert_eq!(v, Value::Map(BTreeMap::new()));
+    }
+
+    #[test]
+    fn test_json_try_into_nested_empty_object() {
+        let jv = json!({ "nested": {} });
+        let v: Value = jv.try_into().unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert("nested".into(), Value::Map(BTreeMap::new()));
+        assert_eq!(v, Value::Map(expected));
+    }
+
+    #[test]
+    fn test_json_try_into_object_case_sensitive_keys() {
+        let jv = json!({ "Key": 1, "key": 2 });
+        let v: Value = jv.try_into().unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert("Key".into(), Value::Int(1));
+        expected.insert("key".into(), Value::Int(2));
+        assert_eq!(v, Value::Map(expected));
+    }
+
+    #[test]
+    fn test_json_try_into_deeply_nested_object() {
+        let jv = json!({
+            "a": { "b": { "c": { "d": 1 } } }
+        });
+        let v: Value = jv.try_into().unwrap();
+
+        let mut dmap = BTreeMap::new();
+        dmap.insert("d".into(), Value::Int(1));
+
+        let mut cmap = BTreeMap::new();
+        cmap.insert("c".into(), Value::Map(dmap));
+
+        let mut bmap = BTreeMap::new();
+        bmap.insert("b".into(), Value::Map(cmap));
+
+        let mut amap = BTreeMap::new();
+        amap.insert("a".into(), Value::Map(bmap));
+
+        assert_eq!(v, Value::Map(amap));
+    }
+
+    #[test]
+    fn test_json_try_into_round_trip() {
+        let original = Value::List(
+            vec![
+                Value::Int(1),
+                Value::Str("abc".into()),
+                Value::Map({
+                    let mut m = BTreeMap::new();
+                    m.insert("k".into(), Value::Bool(true));
+                    m
+                }),
+            ]
+            .into(),
+        );
+
+        // Serialize to JSON
+        let j = to_value(&original).unwrap();
+        dbg!(&j);
+        // Deserialize back to Value
+        let back: Value = j.try_into().unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_json_serialize_unit() {
+        let v = Value::Unit;
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "null");
+    }
+
+    #[test]
+    fn test_json_serialize_deferred() {
+        let v = Value::Deferred;
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "\"⊥\"");
+    }
+
+    #[test]
+    fn test_json_serialize_bool() {
+        let v = Value::Bool(true);
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "true");
+    }
+
+    #[test]
+    fn test_json_serialize_int() {
+        let v = Value::Int(123);
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "123");
+    }
+
+    #[test]
+    fn test_json_serialize_float() {
+        let v = Value::Float(3.14);
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "3.14");
+    }
+
+    #[test]
+    fn test_json_serialize_string() {
+        let v = Value::Str("hello".into());
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "\"hello\"");
+    }
+
+    #[test]
+    fn test_json_serialize_function_as_source_string() {
+        let v = Value::Function(RuntimeFunction::opaque("\\x: Int -> x + 1"));
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "\"\\\\x: Int -> x + 1\"");
+    }
+
+    #[test]
+    fn test_display_function_as_source_string() {
+        let v = Value::Function(RuntimeFunction::opaque("\\x: Int -> x + 1"));
+        assert_eq!(format!("{}", v), "\\x: Int -> x + 1");
+    }
+
+    #[test]
+    fn test_runtime_function_can_carry_callable() {
+        let function = RuntimeFunction::native("identity", |args| {
+            Ok(Box::pin(futures::stream::iter(args.into_iter())))
+        });
+        assert!(function.is_callable());
+
+        let mut stream = function.call(vec![Value::Int(7)].into()).unwrap();
+        let value = futures::executor::block_on(stream.next()).unwrap();
+        assert_eq!(value, Value::Int(7));
+
+        let v = Value::Function(function);
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "\"identity\"");
+    }
+
+    #[test]
+    fn test_json_serialize_list() {
+        let v = Value::List(vec![Value::Int(1), Value::Bool(false)].into());
+        let json = to_string(&v).unwrap();
+        assert_eq!(json, "[1,false]");
+    }
+
+    #[test]
+    fn test_json_serialize_map() {
+        let mut m = BTreeMap::new();
+        m.insert("x".into(), Value::Int(42));
+        m.insert("y".into(), Value::Bool(true));
+        let v = Value::Map(m);
+
+        let json = to_string(&v).unwrap();
+        // Because BTreeMap orders keys, we know the order in the JSON string.
+        assert_eq!(json, "{\"x\":42,\"y\":true}");
+    }
+
+    #[test]
+    fn test_json_round_trip_simple() {
+        let v = Value::List(vec![Value::Str("abc".into()), Value::Int(5)].into());
+        let json = to_string(&v).unwrap();
+        let back: Value = from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn test_json_round_trip_nested_map() {
+        let mut inner = BTreeMap::new();
+        inner.insert("a".into(), Value::Float(1.5));
+
+        let mut outer = BTreeMap::new();
+        outer.insert("inner".into(), Value::Map(inner));
+
+        let v = Value::Map(outer);
+        let json = to_string(&v).unwrap();
+        let back: Value = from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn test_json_empty_array_and_map() {
+        let v_arr = Value::List(vec![].into());
+        let v_map = Value::Map(BTreeMap::new());
+
+        let json_arr = to_string(&v_arr).unwrap();
+        let json_map = to_string(&v_map).unwrap();
+
+        assert_eq!(json_arr, "[]");
+        assert_eq!(json_map, "{}");
+
+        let back_arr: Value = from_str(&json_arr).unwrap();
+        let back_map: Value = from_str(&json_map).unwrap();
+
+        assert_eq!(v_arr, back_arr);
+        assert_eq!(v_map, back_map);
+    }
+
+    #[test]
+    fn test_json_null_maps_to_unit() {
+        let json = "null";
+        let v: Value = from_str(json).unwrap();
+        assert_eq!(v, Value::Unit);
+    }
+
+    #[test]
+    fn test_json_bot_maps_to_deferred() {
+        let v = "\"⊥\"";
+        let json: Value = from_str(&v).unwrap();
+        assert_eq!(json, Value::Deferred);
+    }
+
+    #[test]
+    fn test_format_struct_type() {
+        let typ = StreamType::Struct(
+            vec![
+                ("name".into(), StreamType::Str),
+                ("count".into(), StreamType::Int),
+            ]
+            .into(),
+            false,
+        );
+        assert_eq!(typ.to_string(), "Struct<name: Str, count: Int>");
+
+        let typ = StreamType::Struct(vec![("name".into(), StreamType::Str)].into(), true);
+        assert_eq!(typ.to_string(), "Struct<name: Str, ...>");
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub enum PartialStreamValue<T> {
+    Known(T),
+    NoVal,
+    Deferred,
+}
+
+impl<T: Display> Display for PartialStreamValue<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PartialStreamValue::Known(val) => write!(f, "{}", val),
+            PartialStreamValue::NoVal => write!(f, "no_val"),
+            PartialStreamValue::Deferred => write!(f, "⊥"),
+        }
+    }
+}
+
+impl StreamData for PartialStreamValue<bool> {}
+impl StreamData for PartialStreamValue<i64> {}
+impl StreamData for PartialStreamValue<f64> {}
+impl StreamData for PartialStreamValue<String> {}
+impl StreamData for PartialStreamValue<()> {}
+impl StreamData for PartialStreamValue<EcoVec<Value>> {}
+impl StreamData for PartialStreamValue<Value> {}
+
+impl TryFrom<Value> for PartialStreamValue<i64> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Int(x) => Ok(PartialStreamValue::Known(x)),
+            Value::NoVal => Ok(PartialStreamValue::NoVal),
+            Value::Deferred => Ok(PartialStreamValue::Deferred),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<Value> for PartialStreamValue<String> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Str(x) => Ok(PartialStreamValue::Known(x.into())),
+            Value::NoVal => Ok(PartialStreamValue::NoVal),
+            Value::Deferred => Ok(PartialStreamValue::Deferred),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<Value> for PartialStreamValue<f64> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Float(x) => Ok(PartialStreamValue::Known(x)),
+            Value::NoVal => Ok(PartialStreamValue::NoVal),
+            Value::Deferred => Ok(PartialStreamValue::Deferred),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<Value> for PartialStreamValue<bool> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Bool(x) => Ok(PartialStreamValue::Known(x)),
+            Value::NoVal => Ok(PartialStreamValue::NoVal),
+            Value::Deferred => Ok(PartialStreamValue::Deferred),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<Value> for PartialStreamValue<()> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Unit => Ok(PartialStreamValue::Known(())),
+            Value::NoVal => Ok(PartialStreamValue::NoVal),
+            Value::Deferred => Ok(PartialStreamValue::Deferred),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<Value> for PartialStreamValue<EcoVec<Value>> {
+    type Error = ();
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::List(x) => Ok(PartialStreamValue::Known(x)),
+            Value::NoVal => Ok(PartialStreamValue::NoVal),
+            Value::Deferred => Ok(PartialStreamValue::Deferred),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<PartialStreamValue<i64>> for Value {
+    fn from(value: PartialStreamValue<i64>) -> Self {
+        match value {
+            PartialStreamValue::Known(v) => Value::Int(v),
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}
+
+impl From<PartialStreamValue<f64>> for Value {
+    fn from(value: PartialStreamValue<f64>) -> Self {
+        match value {
+            PartialStreamValue::Known(v) => Value::Float(v),
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}
+impl From<PartialStreamValue<String>> for Value {
+    fn from(value: PartialStreamValue<String>) -> Self {
+        match value {
+            PartialStreamValue::Known(v) => Value::Str(v.into()),
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}
+impl From<PartialStreamValue<bool>> for Value {
+    fn from(value: PartialStreamValue<bool>) -> Self {
+        match value {
+            PartialStreamValue::Known(v) => Value::Bool(v),
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}
+impl From<PartialStreamValue<()>> for Value {
+    fn from(value: PartialStreamValue<()>) -> Self {
+        match value {
+            PartialStreamValue::Known(()) => Value::Unit,
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}
+
+impl From<PartialStreamValue<EcoVec<Value>>> for Value {
+    fn from(value: PartialStreamValue<EcoVec<Value>>) -> Self {
+        match value {
+            PartialStreamValue::Known(v) => Value::List(v),
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}
+
+impl From<PartialStreamValue<Value>> for Value {
+    fn from(value: PartialStreamValue<Value>) -> Self {
+        match value {
+            PartialStreamValue::Known(v) => v,
+            PartialStreamValue::NoVal => Value::NoVal,
+            PartialStreamValue::Deferred => Value::Deferred,
+        }
+    }
+}

@@ -1,0 +1,173 @@
+use crate::testcontainers::ContainerAsync;
+use async_compat::Compat as TokioCompat;
+use futures::StreamExt;
+use futures_timeout::TimeoutExt;
+use serde::ser::Serialize;
+use std::fmt::Debug;
+use testcontainers_modules::{
+    mosquitto::{self, Mosquitto},
+    testcontainers::runners::AsyncRunner,
+};
+use tracing::{debug, info, instrument};
+use trustworthiness_checker::{
+    OutputStream, Value,
+    io::mqtt::{MqttFactory, MqttMessage},
+};
+
+const MQTT_FACTORY: MqttFactory = MqttFactory::Paho;
+
+#[instrument(level = tracing::Level::INFO)]
+pub async fn start_mqtt() -> ContainerAsync<Mosquitto> {
+    let image = mosquitto::Mosquitto::default();
+
+    ContainerAsync::new(
+        TokioCompat::new(image.start())
+            .timeout(std::time::Duration::from_secs(10))
+            .await
+            .expect("Timed out starting Mosquitto test container")
+            .expect("Failed to start Mosquitto test container"),
+    )
+}
+
+#[instrument(level = tracing::Level::INFO)]
+pub async fn get_mqtt_outputs(
+    topic: String,
+    client_name: String,
+    port: u16,
+) -> OutputStream<Value> {
+    // Create a new client
+    let (mqtt_client, stream) = MQTT_FACTORY
+        .connect_and_receive(&format!("tcp://localhost:{}", port), 0)
+        .await
+        .expect("Failed to create MQTT client");
+    info!("Received client for Z",);
+
+    // Try to get the messages
+    //let mut stream = mqtt_client.clone().get_stream(10);
+    mqtt_client.subscribe(&topic, 1).await.unwrap();
+    info!("Subscribed to Z outputs");
+    return Box::pin(stream.map(|msg| {
+        let binding = msg;
+        let payload = binding.payload;
+        let res: Value = serde_json::from_str(&payload).unwrap();
+        debug!(?res, topic=?binding.topic, "Received message");
+
+        // Handle wrapped format {"value": actual_value} from output handler
+        match &res {
+            Value::Map(map) => {
+                if let Some(actual_value) = map.get("value") {
+                    actual_value.clone()
+                } else {
+                    res
+                }
+            }
+            _ => res,
+        }
+    }));
+}
+
+/// Publishes all values from a Vec<Value>.
+#[instrument(level = tracing::Level::INFO)]
+pub async fn dummy_mqtt_publisher<T: Debug + Sized + Serialize + 'static>(
+    client_name: String,
+    topic: String,
+    values: Vec<T>,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    let len = values.len();
+    publish_values(
+        &client_name,
+        &topic,
+        futures::stream::iter(values).boxed_local(),
+        len,
+        port,
+    )
+    .await
+}
+
+/// Publishes all values from an OutputStream<Value>.
+#[instrument(level = tracing::Level::INFO, skip(values))]
+pub async fn dummy_stream_mqtt_publisher<T: Debug + Sized + Serialize + 'static>(
+    client_name: String,
+    topic: String,
+    values: OutputStream<T>,
+    values_len: usize,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    publish_values(&client_name, &topic, values, values_len, port).await
+}
+
+/// Generic logic for the dummy publishers
+async fn publish_values<T: Debug + Sized + Serialize + 'static>(
+    client_name: &str,
+    topic: &str,
+    mut values: OutputStream<T>,
+    values_len: usize,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    info!(
+        "Starting publisher {} for topic {} with {} values",
+        client_name, topic, values_len
+    );
+
+    let mqtt_client = MQTT_FACTORY
+        .connect(&format!("tcp://localhost:{}", port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create MQTT client: {}", e))?;
+
+    let mut index = 0;
+    while let Some(value) = values.next().await {
+        let output_str = serde_json::to_string(&value)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize value {:?}: {:?}", value, e))?;
+
+        let message = MqttMessage::new(topic.to_string(), output_str.clone(), 1);
+
+        info!(
+            "Publishing message {}/{} on topic {}: {}",
+            index + 1,
+            values_len,
+            topic,
+            output_str
+        );
+
+        match mqtt_client.publish(message).await {
+            Ok(_) => {
+                info!(
+                    "Successfully published message {}/{} on topic {}",
+                    index + 1,
+                    values_len,
+                    topic
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Lost MQTT connection with error {:?} on topic {}.",
+                    e,
+                    topic
+                ));
+            }
+        }
+
+        // Add a small delay between publishing messages to avoid overwhelming the broker
+        smol::Timer::after(std::time::Duration::from_millis(50)).await;
+
+        index += 1;
+    }
+
+    info!(
+        "Finished publishing all {} messages for topic {}",
+        values_len, topic
+    );
+
+    // Ensure we wait a moment before disconnecting to allow for message delivery
+    smol::Timer::after(std::time::Duration::from_millis(100)).await;
+
+    if let Err(e) = mqtt_client.disconnect().await {
+        debug!("Failed to disconnect MQTT client {}: {:?}", client_name, e);
+        // Don't fail the test just because disconnection failed
+    } else {
+        debug!("Successfully disconnected MQTT client {}", client_name);
+    }
+
+    Ok(())
+}

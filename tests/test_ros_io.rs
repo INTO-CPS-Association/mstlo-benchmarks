@@ -1,0 +1,194 @@
+#[cfg(test)]
+#[cfg(feature = "ros")]
+mod integration_tests {
+    use std::collections::BTreeMap;
+
+    use futures::StreamExt;
+    use futures::stream;
+    use macro_rules_attribute::apply;
+    use r2r::std_msgs::msg::Int32;
+    use smol::LocalExecutor;
+    use std::rc::Rc;
+    use tc_testutils::ros::generate_xy_test_publisher_tasks_with_topics;
+    use tc_testutils::ros::qualified_ros_name;
+    use tc_testutils::ros::recv_ros_int_stream;
+    use tc_testutils::streams::expect_events_serially;
+    use tracing::info;
+    use trustworthiness_checker::OutputStream;
+    use trustworthiness_checker::Value;
+    use trustworthiness_checker::async_test;
+    use trustworthiness_checker::core::OutputHandler;
+    use trustworthiness_checker::io::ros;
+    use trustworthiness_checker::io::ros::RosOutputHandler;
+    use trustworthiness_checker::io::ros::ros_topic_stream_mapping::{
+        RosMsgType, VariableMappingData,
+    };
+
+    #[apply(async_test)]
+    async fn test_add_monitor_ros_input(ex: Rc<LocalExecutor<'static>>) -> anyhow::Result<()> {
+        let xs_ros = vec![Int32 { data: 1 }, Int32 { data: 2 }];
+        let ys_ros = vec![Int32 { data: 3 }, Int32 { data: 4 }];
+        let xs = vec![Value::Int(1), Value::Int(2)];
+        let ys = vec![Value::Int(3), Value::Int(4)];
+
+        let x_topic = qualified_ros_name(test_add_monitor_ros_input, "x");
+        let y_topic = qualified_ros_name(test_add_monitor_ros_input, "y");
+
+        let var_topics = BTreeMap::from([
+            (
+                "x".to_string(),
+                VariableMappingData {
+                    topic: x_topic.clone(),
+                    msg_type: RosMsgType::Int32,
+                },
+            ),
+            (
+                "y".to_string(),
+                VariableMappingData {
+                    topic: y_topic.clone(),
+                    msg_type: RosMsgType::Int32,
+                },
+            ),
+        ]);
+
+        let mut input_stream = ros::input_stream(ex.clone(), var_topics)?;
+
+        let ((mut x_tick, x_publisher_task), (mut y_tick, y_publisher_task)) =
+            generate_xy_test_publisher_tasks_with_topics(
+                ex.clone(),
+                test_add_monitor_ros_input,
+                &x_topic,
+                &y_topic,
+                xs_ros,
+                ys_ros,
+            );
+
+        expect_events_serially(&mut x_tick, &mut y_tick, &mut input_stream, xs, ys).await?;
+
+        // Final ticks to let them complete
+        x_tick.send(()).await?;
+        y_tick.send(()).await?;
+        // Wait for publishers to complete and then shutdown MQTT server to terminate connections
+        info!("Waiting for publishers to complete...");
+        x_publisher_task.await?;
+        y_publisher_task.await?;
+        info!("All publishers completed, shutting down MQTT server");
+
+        Ok(())
+    }
+
+    #[apply(async_test)]
+    async fn test_add_monitor_ros_output_with_aux(
+        ex: Rc<LocalExecutor<'static>>,
+    ) -> anyhow::Result<()> {
+        // let xs_ros = vec![Int32 { data: 1 }, Int32 { data: 2 }];
+        // let ys_ros = vec![Int32 { data: 3 }, Int32 { data: 4 }];
+        let zs: OutputStream<Value> = Box::pin(stream::iter(vec![1.into(), 2.into()]));
+        let ws: OutputStream<Value> = Box::pin(stream::iter(vec![3.into(), 4.into()]));
+
+        let z_topic = qualified_ros_name(test_add_monitor_ros_output_with_aux, "z");
+
+        let var_topics = BTreeMap::from([(
+            "z".to_string(),
+            VariableMappingData {
+                topic: z_topic.clone(),
+                msg_type: RosMsgType::Int32,
+            },
+        )]);
+
+        let aux_info = vec!["w".into()];
+
+        // Create the ROS output handler
+        let mut output_handler = RosOutputHandler::new(
+            ex.clone(),
+            qualified_ros_name(test_add_monitor_ros_output_with_aux, "pub"),
+            var_topics,
+            aux_info,
+        )
+        .unwrap();
+
+        let streams = BTreeMap::from([
+            (trustworthiness_checker::VarName::new("w"), ws),
+            (trustworthiness_checker::VarName::new("z"), zs),
+        ]);
+        output_handler.provide_streams(streams);
+
+        let z_output_stream = recv_ros_int_stream(
+            ex.clone(),
+            qualified_ros_name(test_add_monitor_ros_output_with_aux, "z_int_receiver"),
+            z_topic,
+            1,
+        )
+        .unwrap()
+        .take(2);
+        let w_topic = qualified_ros_name(test_add_monitor_ros_output_with_aux, "w");
+        let w_output_stream = recv_ros_int_stream(
+            ex.clone(),
+            qualified_ros_name(test_add_monitor_ros_output_with_aux, "w_int_receiver"),
+            w_topic,
+            1,
+        )
+        .unwrap()
+        .take(2);
+
+        ex.spawn(output_handler.run()).detach();
+
+        let z_expected_output = vec![1, 2];
+        let z_actual_output = z_output_stream.collect::<Vec<_>>().await;
+        assert_eq!(z_actual_output, z_expected_output);
+
+        let w_expected_output: Vec<i32> = vec![];
+        let w_actual_output = w_output_stream.collect::<Vec<_>>().await;
+        assert_eq!(w_actual_output, w_expected_output);
+
+        Ok(())
+    }
+
+    #[apply(async_test)]
+    async fn test_add_monitor_ros_output_no_aux(
+        ex: Rc<LocalExecutor<'static>>,
+    ) -> anyhow::Result<()> {
+        let zs: OutputStream<Value> = Box::pin(stream::iter(vec![1.into(), 2.into()]));
+
+        let z_topic = qualified_ros_name(test_add_monitor_ros_output_no_aux, "z");
+
+        let var_topics = BTreeMap::from([(
+            "z".to_string(),
+            VariableMappingData {
+                topic: z_topic.clone(),
+                msg_type: RosMsgType::Int32,
+            },
+        )]);
+
+        let aux_info = vec![];
+
+        // Create the ROS output handler
+        let mut output_handler = RosOutputHandler::new(
+            ex.clone(),
+            qualified_ros_name(test_add_monitor_ros_output_no_aux, "pub"),
+            var_topics,
+            aux_info,
+        )
+        .unwrap();
+
+        let streams = BTreeMap::from([(trustworthiness_checker::VarName::new("z"), zs)]);
+        output_handler.provide_streams(streams);
+
+        let z_output_stream = recv_ros_int_stream(
+            ex.clone(),
+            qualified_ros_name(test_add_monitor_ros_output_no_aux, "z_int_receiver"),
+            z_topic,
+            1,
+        )
+        .unwrap()
+        .take(2);
+
+        ex.spawn(output_handler.run()).detach();
+
+        let z_expected_output = vec![1, 2];
+        let z_actual_output = z_output_stream.collect::<Vec<_>>().await;
+        assert_eq!(z_actual_output, z_expected_output);
+
+        Ok(())
+    }
+}

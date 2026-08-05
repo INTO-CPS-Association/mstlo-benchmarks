@@ -1,0 +1,165 @@
+use std::rc::Rc;
+use std::time::Duration;
+use trustworthiness_checker::benches_common::monitor_outputs_specialized_dataflow_limited;
+use trustworthiness_checker::benches_common::monitor_outputs_untyped_async_limited;
+use trustworthiness_checker::benches_common::monitor_outputs_untyped_dataflow_limited;
+use trustworthiness_checker::benches_common::monitor_outputs_untyped_semisync_limited;
+
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::SamplingMode;
+use criterion::async_executor::AsyncExecutor;
+use criterion::{criterion_group, criterion_main};
+use itertools::Itertools;
+use smol::LocalExecutor;
+use trustworthiness_checker::DsrvSpecification;
+use trustworthiness_checker::dsrv_fixtures::spec_deferred_and;
+use trustworthiness_checker::dsrv_fixtures::spec_direct_and;
+use trustworthiness_checker::dsrv_fixtures::{
+    direct_paper_benchmark_input_stream, paper_benchmark_input_stream,
+};
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[derive(Clone)]
+struct LocalSmolExecutor {
+    pub executor: Rc<LocalExecutor<'static>>,
+}
+
+impl LocalSmolExecutor {
+    fn new() -> Self {
+        Self {
+            executor: Rc::new(LocalExecutor::new()),
+        }
+    }
+}
+
+impl AsyncExecutor for LocalSmolExecutor {
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        smol::block_on(self.executor.run(future))
+    }
+}
+
+fn from_elem(c: &mut Criterion) {
+    let sizes = vec![
+        1, 25000, 50000, 75000, 100000,
+        // 1000000,
+    ];
+
+    let mut group = c.benchmark_group("dyn_paper");
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    let spec_direct = spec_direct_and()
+        .parse::<DsrvSpecification>()
+        .expect("direct benchmark specification should parse");
+    let spec = spec_deferred_and()
+        .parse::<DsrvSpecification>()
+        .expect("deferred benchmark specification should parse");
+    let percents = vec![0, 25, 50, 75, 100];
+
+    for size in sizes.iter() {
+        let input_stream_fn = || direct_paper_benchmark_input_stream(*size);
+        group.bench_with_input(
+            BenchmarkId::new("dyn_paper_direct", size),
+            &(&spec_direct),
+            |b, &spec| {
+                let benchmark_executor = LocalSmolExecutor::new();
+                b.to_async(benchmark_executor.clone()).iter(|| {
+                    monitor_outputs_untyped_async_limited(
+                        benchmark_executor.executor.clone(),
+                        spec.clone(),
+                        input_stream_fn(),
+                        *size,
+                    )
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("dyn_paper_direct_dataflow", size),
+            &(&spec_direct),
+            |b, &spec| {
+                let benchmark_executor = LocalSmolExecutor::new();
+                b.to_async(benchmark_executor.clone()).iter(|| {
+                    monitor_outputs_untyped_dataflow_limited(
+                        benchmark_executor.executor.clone(),
+                        spec.clone(),
+                        input_stream_fn(),
+                        *size,
+                    )
+                })
+            },
+        );
+    }
+
+    for (size, percent) in sizes.into_iter().cartesian_product(percents) {
+        let input_stream_fn = || paper_benchmark_input_stream(percent, size);
+        group.bench_with_input(
+            BenchmarkId::new(format!("dyn_paper_{}", percent), size),
+            &(&spec),
+            |b, &spec| {
+                let benchmark_executor = LocalSmolExecutor::new();
+                b.to_async(benchmark_executor.clone()).iter(|| {
+                    monitor_outputs_untyped_async_limited(
+                        benchmark_executor.executor.clone(),
+                        spec.clone(),
+                        input_stream_fn(),
+                        size,
+                    )
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("dyn_paper_{}_semisync", percent), size),
+            &(&spec),
+            |b, &spec| {
+                let benchmark_executor = LocalSmolExecutor::new();
+                b.to_async(benchmark_executor.clone()).iter(|| {
+                    monitor_outputs_untyped_semisync_limited(
+                        benchmark_executor.executor.clone(),
+                        spec.clone(),
+                        input_stream_fn(),
+                        size,
+                    )
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("dyn_paper_{}_dataflow", percent), size),
+            &(&spec),
+            |b, &spec| {
+                let benchmark_executor = LocalSmolExecutor::new();
+                b.to_async(benchmark_executor.clone()).iter(|| {
+                    monitor_outputs_untyped_dataflow_limited(
+                        benchmark_executor.executor.clone(),
+                        spec.clone(),
+                        input_stream_fn(),
+                        size,
+                    )
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("dyn_paper_{}_dataflow_specialised", percent), size),
+            &(&spec),
+            |b, &spec| {
+                let benchmark_executor = LocalSmolExecutor::new();
+                b.to_async(benchmark_executor.clone()).iter(|| {
+                    monitor_outputs_specialized_dataflow_limited(
+                        benchmark_executor.executor.clone(),
+                        spec.clone(),
+                        input_stream_fn(),
+                        size,
+                    )
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, from_elem);
+criterion_main!(benches);

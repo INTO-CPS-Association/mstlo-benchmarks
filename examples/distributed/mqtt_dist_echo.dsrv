@@ -1,0 +1,20 @@
+// Run with: cargo run -- examples/distributed/mqtt_dist_echo.dsrv --input-mqtt-topics tb1 tb2 tb3 --output-mqtt-topics tb1Echo tb2Echo tb3Echo tb1SourceRobotId tb1NearbyRobotIds tb1NearbyRobotPoses tb1SourceRobotPose tb1Timestamp
+in tb1
+in tb2
+in tb3
+out tb1Echo
+out tb2Echo
+out tb3Echo
+out tb1SourceRobotId
+out tb1NearbyRobotIds
+out tb1NearbyRobotPoses
+out tb1SourceRobotPose
+out tb1Timestamp
+tb1NearbyRobotIds = Map.get(tb1, "nearby_robot_ids")
+tb1NearbyRobotPoses = Map.get(tb1, "nearby_robot_poses")
+tb1SourceRobotId = Map.get(tb1, "source_robot_id")
+tb1SourceRobotPose = Map.get(tb1, "source_robot_pose")
+tb1Timestamp = Map.get(tb1, "timestamp")
+tb1Echo = tb1
+tb2Echo = tb2
+tb3Echo = tb3
