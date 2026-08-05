@@ -26,12 +26,14 @@ const PROPERTY_EMULATOR_CONFIG: &str = concat!(
 #[derive(Resource)]
 pub struct TrustworthinessCheckerProcesses {
     children: Vec<Child>,
+    run_dir: Option<PathBuf>,
 }
 
 impl TrustworthinessCheckerProcesses {
     pub fn none() -> Self {
         Self {
             children: Vec::new(),
+            run_dir: None,
         }
     }
 
@@ -61,7 +63,18 @@ impl TrustworthinessCheckerProcesses {
         }
         children.push(spawn_scheduler(args, &bundle)?);
 
-        Ok(Self { children })
+        Ok(Self {
+            children,
+            run_dir: Some(bundle.run_dir),
+        })
+    }
+
+    pub fn child_pids(&self) -> Vec<u32> {
+        self.children.iter().map(Child::id).collect()
+    }
+
+    pub fn run_dir(&self) -> Option<&Path> {
+        self.run_dir.as_deref()
     }
 }
 
@@ -758,8 +771,8 @@ fn format_float(value: f64) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
-enum MachineProperty {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MachineProperty {
     ConveyorSystem,
     StackerCrane,
     VerticalLift,
@@ -767,14 +780,14 @@ enum MachineProperty {
 }
 
 impl MachineProperty {
-    const ALL: [MachineProperty; 4] = [
+    pub const ALL: [MachineProperty; 4] = [
         MachineProperty::ConveyorSystem,
         MachineProperty::StackerCrane,
         MachineProperty::VerticalLift,
         MachineProperty::HorizontalCarousel,
     ];
 
-    fn input_var(self) -> &'static str {
+    pub fn input_var(self) -> &'static str {
         match self {
             MachineProperty::ConveyorSystem => "ConveyorSystem",
             MachineProperty::StackerCrane => "StackerCrane",
@@ -783,7 +796,7 @@ impl MachineProperty {
         }
     }
 
-    fn predicate_var(self) -> &'static str {
+    pub fn predicate_var(self) -> &'static str {
         match self {
             MachineProperty::ConveyorSystem => "CPred",
             MachineProperty::StackerCrane => "SPred",
@@ -801,7 +814,7 @@ impl MachineProperty {
         }
     }
 
-    fn center(self) -> (f64, f64) {
+    pub fn center(self) -> (f64, f64) {
         match self {
             MachineProperty::ConveyorSystem => (3.5, 3.0),
             MachineProperty::StackerCrane => (3.5, -6.0),
@@ -810,7 +823,7 @@ impl MachineProperty {
         }
     }
 
-    fn short_name(self) -> &'static str {
+    pub fn short_name(self) -> &'static str {
         match self {
             MachineProperty::ConveyorSystem => "C",
             MachineProperty::StackerCrane => "S",
@@ -827,7 +840,6 @@ impl MachineProperty {
             MachineProperty::HorizontalCarousel => "horizontal_carousel",
         }
     }
-
 }
 
 fn node_name(robot_index: usize) -> String {
@@ -863,6 +875,7 @@ mod tests {
             publish_rate_hz: 10.0,
             robot_radius: 0.12,
             robot_labels: false,
+            screenshot: false,
             wall_avoidance_margin: 1.0,
             wall_avoidance_strength: 2.0,
             render_scale: 60.0,
@@ -893,12 +906,12 @@ mod tests {
 
         assert!(spec.contains("aux baR1C: Bool"));
         assert!(spec.contains("aux baR2V: Bool"));
-        assert!(spec.contains(
-            "baR1C = (abs(r1Pose.x - 3.5) <= 5.0 && abs(r1Pose.y - 3.0) <= 5.0)"
-        ));
-        assert!(spec.contains(
-            "baR2V = (abs(r2Pose.x + 4.0) <= 5.0 && abs(r2Pose.y + 6.0) <= 5.0)"
-        ));
+        assert!(
+            spec.contains("baR1C = (abs(r1Pose.x - 3.5) <= 5.0 && abs(r1Pose.y - 3.0) <= 5.0)")
+        );
+        assert!(
+            spec.contains("baR2V = (abs(r2Pose.x + 4.0) <= 5.0 && abs(r2Pose.y + 6.0) <= 5.0)")
+        );
         assert!(spec.contains(
             "distCPred = (if (baR1C || baR2C) then ((baR1C && monitored_at(CPred, \"R1\")) || (baR2C && monitored_at(CPred, \"R2\"))) else true)"
         ));

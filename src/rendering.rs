@@ -4,7 +4,7 @@ use crate::{
     robot::{
         HighlightQuadrant, MonitorHighlightLayer, Robot, RobotLabel, RobotMonitorCircle, RobotPose,
     },
-    ros::{RosBridgeHandle, TrustMonitorState},
+    ros::{RosBridgeHandle, TcAssignmentState},
     simulation::SimulationConfig,
 };
 
@@ -45,19 +45,19 @@ fn spawn_machine_region_overlays(commands: &mut Commands, config: &SimulationCon
             Transform::from_xyz(rendered.x, rendered.y, -0.8),
         ));
 
-        spawn_region_border(commands, quadrant, rendered, region_size);
-        spawn_machine_marker(commands, quadrant, rendered, config.render_scale);
+        spawn_region_border(commands, config, quadrant, rendered, region_size);
+        spawn_machine_marker(commands, quadrant, rendered, config);
 
         commands.spawn((
             Text2d::new(label),
             TextFont {
-                font_size: FontSize::Px(20.0),
+                font_size: FontSize::Px(config.machine_label_font_size()),
                 ..default()
             },
             TextColor(Color::srgba(0.05, 0.06, 0.07, 1.0)),
             Transform::from_xyz(
                 rendered.x,
-                rendered.y + config.render_scale * 0.68,
+                rendered.y + config.machine_label_y_offset(),
                 0.2,
             ),
         ));
@@ -68,9 +68,13 @@ fn spawn_machine_marker(
     commands: &mut Commands,
     quadrant: HighlightQuadrant,
     center: Vec2,
-    render_scale: f32,
+    config: &SimulationConfig,
 ) {
-    let marker_size = Vec2::new(render_scale * 1.2, render_scale * 0.7);
+    let marker_scale = config.machine_marker_scale();
+    let marker_size = Vec2::new(
+        config.render_scale * 1.2 * marker_scale,
+        config.render_scale * 0.7 * marker_scale,
+    );
     commands.spawn((
         Sprite {
             color: quadrant_color(quadrant, 0.92),
@@ -116,12 +120,13 @@ fn spawn_machine_marker(
 
 fn spawn_region_border(
     commands: &mut Commands,
+    config: &SimulationConfig,
     quadrant: HighlightQuadrant,
     center: Vec2,
     size: Vec2,
 ) {
     let color = quadrant_color(quadrant, 0.90);
-    let thickness = 4.0;
+    let thickness = config.region_border_thickness();
     for (x, y, w, h) in [
         (center.x, center.y + size.y * 0.5, size.x, thickness),
         (center.x, center.y - size.y * 0.5, size.x, thickness),
@@ -142,7 +147,7 @@ fn spawn_region_border(
 pub fn sync_robot_monitor_circles(
     config: Res<SimulationConfig>,
     ros: Res<RosBridgeHandle>,
-    mut monitor_state: ResMut<TrustMonitorState>,
+    mut tc_assignment_state: ResMut<TcAssignmentState>,
     robots: Query<(&Robot, &RobotPose)>,
     mut circles: Query<(
         &RobotMonitorCircle,
@@ -151,7 +156,7 @@ pub fn sync_robot_monitor_circles(
         &mut Visibility,
     )>,
 ) {
-    monitor_state.drain_updates(&ros);
+    tc_assignment_state.drain_updates(&ros);
 
     for (circle, mut sprite, mut transform, mut visibility) in &mut circles {
         if let Some((_, pose)) = robots.iter().find(|(robot, _)| robot.id == circle.robot_id) {
@@ -160,18 +165,18 @@ pub fn sync_robot_monitor_circles(
             transform.translation.y = rendered.y;
         }
 
-        let monitored_quadrants = monitor_state.monitored_quadrants(circle.robot_id);
-        if !monitored_quadrants.contains(&circle.quadrant) {
+        let assigned_quadrants = tc_assignment_state.assigned_quadrants(circle.robot_id);
+        if !assigned_quadrants.contains(&circle.quadrant) {
             *visibility = Visibility::Hidden;
             continue;
         }
 
-        let active_index = monitored_quadrants
+        let active_index = assigned_quadrants
             .iter()
             .position(|quadrant| *quadrant == circle.quadrant)
             .unwrap_or(0);
-        let stack_index = if monitored_quadrants.len() > 1 {
-            monitored_quadrants
+        let stack_index = if assigned_quadrants.len() > 1 {
+            assigned_quadrants
                 .len()
                 .saturating_sub(1)
                 .saturating_sub(active_index)
@@ -182,19 +187,16 @@ pub fn sync_robot_monitor_circles(
         transform.translation.z = match circle.layer {
             MonitorHighlightLayer::Glow => 0.35 + active_index as f32 * 0.08,
             MonitorHighlightLayer::Ring => 0.45 + active_index as f32 * 0.08,
-            MonitorHighlightLayer::Cutout => 0.0,
         };
-        let diameter = if monitored_quadrants.len() > 1 {
+        let diameter = if assigned_quadrants.len() > 1 {
             match circle.layer {
                 MonitorHighlightLayer::Glow => config.render_radius() * 5.0 + scale_offset,
                 MonitorHighlightLayer::Ring => config.render_radius() * 4.0 + scale_offset,
-                MonitorHighlightLayer::Cutout => 0.0,
             }
         } else {
             match circle.layer {
                 MonitorHighlightLayer::Glow => config.render_radius() * 5.0,
                 MonitorHighlightLayer::Ring => config.render_radius() * 4.0,
-                MonitorHighlightLayer::Cutout => 0.0,
             }
         };
         sprite.custom_size = Some(Vec2::splat(diameter));
@@ -211,18 +213,20 @@ pub fn sync_robot_labels(
     for (label, mut transform) in &mut labels {
         if let Some((_, pose)) = robots.iter().find(|(robot, _)| robot.id == label.robot_id) {
             let rendered = config.render_position(pose.x, pose.y);
-            transform.translation.x = rendered.x + config.render_radius() + 4.0;
-            transform.translation.y = rendered.y + config.render_radius() + 4.0;
+            transform.translation.x =
+                rendered.x + config.render_radius() + config.robot_label_offset();
+            transform.translation.y =
+                rendered.y + config.render_radius() + config.robot_label_offset();
         }
     }
 }
 
 pub fn quadrant_color(quadrant: HighlightQuadrant, alpha: f32) -> Color {
     match quadrant {
-        HighlightQuadrant::Ne => Color::srgba(0.8, 0.0, 0.0, alpha),
-        HighlightQuadrant::Nw => Color::srgba(0.8, 0.8, 0.0, alpha),
-        HighlightQuadrant::Sw => Color::srgba(0.0, 0.4, 0.8, alpha),
-        HighlightQuadrant::Se => Color::srgba(0.0, 0.8, 0.0, alpha),
+        HighlightQuadrant::Nw => Color::srgba(0.8, 0.0, 0.0, alpha),
+        HighlightQuadrant::Ne => Color::srgba(0.0, 0.8, 0.0, alpha),
+        HighlightQuadrant::Sw => Color::srgba(0.8, 0.8, 0.0, alpha),
+        HighlightQuadrant::Se => Color::srgba(0.0, 0.4, 0.8, alpha),
     }
 }
 
@@ -230,6 +234,5 @@ fn monitor_highlight_color(quadrant: HighlightQuadrant, layer: MonitorHighlightL
     match layer {
         MonitorHighlightLayer::Glow => quadrant_color(quadrant, 0.22),
         MonitorHighlightLayer::Ring => quadrant_color(quadrant, 0.96),
-        MonitorHighlightLayer::Cutout => Color::srgba(0.0, 0.0, 0.0, 0.0),
     }
 }

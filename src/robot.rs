@@ -48,7 +48,6 @@ pub enum HighlightQuadrant {
 pub enum MonitorHighlightLayer {
     Glow,
     Ring,
-    Cutout,
 }
 
 #[derive(Component)]

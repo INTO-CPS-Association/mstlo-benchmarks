@@ -24,6 +24,7 @@ pub struct SimulationConfig {
     pub publish_rate_hz: f32,
     pub robot_radius: f32,
     pub robot_labels: bool,
+    pub screenshot: bool,
     pub wall_avoidance_margin: f32,
     pub wall_avoidance_strength: f32,
     pub render_scale: f32,
@@ -44,6 +45,7 @@ impl From<Args> for SimulationConfig {
             publish_rate_hz: args.publish_rate_hz,
             robot_radius: args.robot_radius,
             robot_labels: args.robot_labels,
+            screenshot: args.screenshot,
             wall_avoidance_margin: args.wall_avoidance_margin,
             wall_avoidance_strength: args.wall_avoidance_strength,
             render_scale: 60.0,
@@ -93,7 +95,33 @@ impl SimulationConfig {
     }
 
     pub fn render_radius(&self) -> f32 {
-        self.robot_radius * self.render_scale
+        let multiplier = if self.screenshot { 2.6 } else { 1.0 };
+        self.robot_radius * self.render_scale * multiplier
+    }
+
+    pub fn robot_label_font_size(&self) -> f32 {
+        if self.screenshot { 28.0 } else { 13.0 }
+    }
+
+    pub fn robot_label_offset(&self) -> f32 {
+        if self.screenshot { 10.0 } else { 4.0 }
+    }
+
+    pub fn machine_label_font_size(&self) -> f32 {
+        if self.screenshot { 34.0 } else { 20.0 }
+    }
+
+    pub fn machine_label_y_offset(&self) -> f32 {
+        let multiplier = if self.screenshot { 1.15 } else { 0.68 };
+        self.render_scale * multiplier
+    }
+
+    pub fn machine_marker_scale(&self) -> f32 {
+        if self.screenshot { 1.8 } else { 1.0 }
+    }
+
+    pub fn region_border_thickness(&self) -> f32 {
+        if self.screenshot { 8.0 } else { 4.0 }
     }
 }
 
@@ -119,13 +147,13 @@ pub fn spawn_robots(
         let position = initial_position_for_robot(&config, &mut rng.rng, id);
         let x = position.x;
         let y = position.y;
-        let hue = (id as f32 * 0.618_034).fract() * 360.0;
+        let robot_color = robot_color(id);
 
         commands.spawn((
             Robot { id },
             RobotPose { x, y, theta: 0.0 },
             Sprite {
-                color: Color::hsl(hue, 0.76, 0.55),
+                color: robot_color,
                 custom_size: Some(Vec2::splat(config.render_radius() * 2.0)),
                 ..default()
             },
@@ -143,13 +171,17 @@ pub fn spawn_robots(
                 RobotLabel { robot_id: id },
                 Text2d::new(id.to_string()),
                 TextFont {
-                    font_size: FontSize::Px(13.0),
+                    font_size: FontSize::Px(config.robot_label_font_size()),
                     ..default()
                 },
                 TextColor(Color::WHITE),
                 Transform::from_xyz(
-                    config.render_position(x, y).x + config.render_radius() + 4.0,
-                    config.render_position(x, y).y + config.render_radius() + 4.0,
+                    config.render_position(x, y).x
+                        + config.render_radius()
+                        + config.robot_label_offset(),
+                    config.render_position(x, y).y
+                        + config.render_radius()
+                        + config.robot_label_offset(),
                     2.0,
                 ),
             ));
@@ -165,6 +197,50 @@ pub fn initial_robot_positions(config: &SimulationConfig) -> Vec<RobotPosition> 
     (0..config.robots)
         .map(|id| initial_position_for_robot(config, &mut rng, id))
         .collect()
+}
+
+pub fn advance_robot_positions(
+    config: &SimulationConfig,
+    rng: &mut SimulationRng,
+    positions: &mut [RobotPosition],
+) {
+    let dt = 1.0 / config.sim_hz;
+    let step_sigma = config.brownian_scale * dt.sqrt();
+    let min = Vec2::new(config.robot_min_x(), config.robot_min_y());
+    let max = Vec2::new(config.robot_max_x(), config.robot_max_y());
+
+    positions.sort_by_key(|position| position.id);
+    for position in positions {
+        let dx: f32 = rng.rng.sample(StandardNormal);
+        let dy: f32 = rng.rng.sample(StandardNormal);
+        let old_x = position.x;
+        let old_y = position.y;
+        let wall_drift = wall_avoidance_drift(
+            Vec2::new(position.x, position.y),
+            min,
+            max,
+            config.wall_avoidance_margin,
+            config.wall_avoidance_strength,
+        ) * dt;
+
+        position.x = (position.x + dx * step_sigma + wall_drift.x).clamp(min.x, max.x);
+        position.y = (position.y + dy * step_sigma + wall_drift.y).clamp(min.y, max.y);
+        position.theta = (position.y - old_y).atan2(position.x - old_x);
+    }
+}
+
+fn robot_color(id: usize) -> Color {
+    const ROBOT_COLORS: [Color; 8] = [
+        Color::srgb(0.55, 0.20, 0.75), // purple
+        Color::srgb(0.95, 0.45, 0.10), // orange
+        Color::srgb(0.00, 0.65, 0.75), // teal
+        Color::srgb(0.90, 0.15, 0.55), // magenta
+        Color::srgb(0.35, 0.35, 0.35), // dark gray
+        Color::srgb(0.45, 0.25, 0.05), // brown
+        Color::srgb(0.00, 0.35, 0.35), // dark cyan
+        Color::srgb(0.55, 0.45, 0.80), // lavender
+    ];
+    ROBOT_COLORS[id % ROBOT_COLORS.len()]
 }
 
 fn initial_position_for_robot(
@@ -249,30 +325,18 @@ pub fn move_robots(
     mut rng: ResMut<SimulationRng>,
     mut robots: Query<(&Robot, &mut RobotPose, &mut Transform)>,
 ) {
-    let dt = 1.0 / config.sim_hz;
-    let step_sigma = config.brownian_scale * dt.sqrt();
-    let min = Vec2::new(config.robot_min_x(), config.robot_min_y());
-    let max = Vec2::new(config.robot_max_x(), config.robot_max_y());
-
     let mut ordered = robots.iter_mut().collect::<Vec<_>>();
     ordered.sort_by_key(|(robot, _, _)| robot.id);
+    let mut positions = ordered
+        .iter()
+        .map(|(robot, pose, _)| RobotPosition::from((**robot, **pose)))
+        .collect::<Vec<_>>();
+    advance_robot_positions(&config, &mut rng, &mut positions);
 
-    for (_, mut pose, mut transform) in ordered {
-        let dx: f32 = rng.rng.sample(StandardNormal);
-        let dy: f32 = rng.rng.sample(StandardNormal);
-        let old_x = pose.x;
-        let old_y = pose.y;
-        let wall_drift = wall_avoidance_drift(
-            Vec2::new(pose.x, pose.y),
-            min,
-            max,
-            config.wall_avoidance_margin,
-            config.wall_avoidance_strength,
-        ) * dt;
-
-        pose.x = (pose.x + dx * step_sigma + wall_drift.x).clamp(min.x, max.x);
-        pose.y = (pose.y + dy * step_sigma + wall_drift.y).clamp(min.y, max.y);
-        pose.theta = (pose.y - old_y).atan2(pose.x - old_x);
+    for ((_, mut pose, mut transform), position) in ordered.into_iter().zip(positions) {
+        pose.x = position.x;
+        pose.y = position.y;
+        pose.theta = position.theta;
 
         let rendered = config.render_position(pose.x, pose.y);
         transform.translation.x = rendered.x;
@@ -318,6 +382,7 @@ mod tests {
             publish_rate_hz: 5.0,
             robot_radius: 4.0,
             robot_labels: false,
+            screenshot: false,
             wall_avoidance_margin: 12.0,
             wall_avoidance_strength: 40.0,
             render_scale: 60.0,
@@ -344,6 +409,7 @@ mod tests {
             publish_rate_hz: 5.0,
             robot_radius: 4.0,
             robot_labels: false,
+            screenshot: false,
             wall_avoidance_margin: 12.0,
             wall_avoidance_strength: 40.0,
             render_scale: 60.0,
@@ -377,6 +443,7 @@ mod tests {
             publish_rate_hz: 5.0,
             robot_radius: 4.0,
             robot_labels: false,
+            screenshot: false,
             wall_avoidance_margin: 12.0,
             wall_avoidance_strength: 80.0,
             render_scale: 60.0,

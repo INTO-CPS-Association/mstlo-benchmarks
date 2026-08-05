@@ -14,48 +14,58 @@ use crate::{
     simulation::SimulationConfig,
 };
 
-const TRUST_MONITOR_LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(3);
-const TRUST_MONITOR_DISCOVERY_SPINS: usize = 10;
-const TRUST_MONITOR_DISCOVERY_SPIN_INTERVAL: Duration = Duration::from_millis(100);
+const TC_LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const TC_DISCOVERY_SPINS: usize = 10;
+const TC_DISCOVERY_SPIN_INTERVAL: Duration = Duration::from_millis(100);
+
+type TcAssignments = Vec<Vec<HighlightQuadrant>>;
+type TcUpdateReceiver = Arc<Mutex<mpsc::Receiver<TcAssignments>>>;
 
 #[derive(Resource)]
 pub struct RosBridgeHandle {
     pub sender: Sender<Vec<RobotPosition>>,
     pub _worker: Option<thread::JoinHandle<()>>,
-    pub trust_monitor_updates: Option<Arc<Mutex<mpsc::Receiver<Vec<Vec<HighlightQuadrant>>>>>>,
-    pub _trust_monitor_worker: Option<thread::JoinHandle<()>>,
+    pub tc_updates: Option<TcUpdateReceiver>,
+    pub _tc_worker: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Resource)]
-pub struct TrustMonitorState {
-    monitored: Vec<Vec<HighlightQuadrant>>,
+pub struct TcAssignmentState {
+    assignments: TcAssignments,
 }
 
-impl TrustMonitorState {
+impl TcAssignmentState {
     pub fn new(robots: usize) -> Self {
         Self {
-            monitored: vec![Vec::new(); robots],
+            assignments: vec![Vec::new(); robots],
         }
     }
 
-    pub fn drain_updates(&mut self, ros: &RosBridgeHandle) {
-        let Some(receiver) = &ros.trust_monitor_updates else {
-            return;
+    pub fn drain_updates(&mut self, ros: &RosBridgeHandle) -> usize {
+        let Some(receiver) = &ros.tc_updates else {
+            return 0;
         };
         let Ok(receiver) = receiver.lock() else {
-            return;
+            return 0;
         };
 
-        while let Ok(monitored) = receiver.try_recv() {
-            self.monitored = monitored;
+        let mut updates = 0;
+        while let Ok(assignments) = receiver.try_recv() {
+            self.assignments = assignments;
+            updates += 1;
         }
+        updates
     }
 
-    pub fn monitored_quadrants(&self, robot_id: usize) -> &[HighlightQuadrant] {
-        self.monitored
+    pub fn assigned_quadrants(&self, robot_id: usize) -> &[HighlightQuadrant] {
+        self.assignments
             .get(robot_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub fn assignments(&self) -> &[Vec<HighlightQuadrant>] {
+        &self.assignments
     }
 }
 
@@ -93,34 +103,28 @@ impl RosBridge {
     }
 }
 
-pub fn start_trust_monitor_reconfig_listener(
+pub fn start_tc_reconfiguration_listener(
     config: SimulationConfig,
-) -> Result<
-    (
-        Arc<Mutex<mpsc::Receiver<Vec<Vec<HighlightQuadrant>>>>>,
-        thread::JoinHandle<()>,
-    ),
-    String,
-> {
+) -> Result<(TcUpdateReceiver, thread::JoinHandle<()>), String> {
     let (sender, receiver) = mpsc::channel();
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let receiver = Arc::new(Mutex::new(receiver));
     let handle = thread::Builder::new()
-        .name("trust-monitor-reconfig-listener".to_string())
-        .spawn(move || run_trust_monitor_reconfig_listener(config, sender, ready_sender))
-        .map_err(|err| format!("failed to spawn trust monitor reconfig listener: {err}"))?;
+        .name("tc-reconfiguration-listener".to_string())
+        .spawn(move || run_tc_reconfiguration_listener(config, sender, ready_sender))
+        .map_err(|err| format!("failed to spawn TC reconfiguration listener: {err}"))?;
 
-    match ready_receiver.recv_timeout(TRUST_MONITOR_LISTENER_READY_TIMEOUT) {
+    match ready_receiver.recv_timeout(TC_LISTENER_READY_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => return Err(err),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             eprintln!(
-                "WARN trust monitor reconfig listener did not report ready within {:?}; continuing",
-                TRUST_MONITOR_LISTENER_READY_TIMEOUT
+                "WARN TC reconfiguration listener did not report ready within {:?}; continuing",
+                TC_LISTENER_READY_TIMEOUT
             );
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err("trust monitor reconfig listener exited before becoming ready".to_string());
+            return Err("TC reconfiguration listener exited before becoming ready".to_string());
         }
     }
 
@@ -175,9 +179,9 @@ fn publish_positions(positions: &[RobotPosition], publishers: &[Publisher<Pose2D
     }
 }
 
-fn run_trust_monitor_reconfig_listener(
+fn run_tc_reconfiguration_listener(
     config: SimulationConfig,
-    sender: mpsc::Sender<Vec<Vec<HighlightQuadrant>>>,
+    sender: mpsc::Sender<TcAssignments>,
     ready_sender: mpsc::SyncSender<Result<(), String>>,
 ) {
     if config.robots == 0 {
@@ -188,16 +192,16 @@ fn run_trust_monitor_reconfig_listener(
     let ctx = match Context::create() {
         Ok(ctx) => ctx,
         Err(err) => {
-            let message = format!("failed to create ROS context for trust monitor listener: {err}");
+            let message = format!("failed to create ROS context for TC listener: {err}");
             eprintln!("{message}");
             let _ = ready_sender.send(Err(message));
             return;
         }
     };
-    let mut node = match Node::create(ctx, "trust_monitor_reconfig_listener", "") {
+    let mut node = match Node::create(ctx, "tc_reconfiguration_listener", "") {
         Ok(node) => node,
         Err(err) => {
-            let message = format!("failed to create trust monitor reconfig listener node: {err}");
+            let message = format!("failed to create TC reconfiguration listener node: {err}");
             eprintln!("{message}");
             let _ = ready_sender.send(Err(message));
             return;
@@ -214,11 +218,10 @@ fn run_trust_monitor_reconfig_listener(
 
     for worker_id in 0..config.robots {
         let topic = format!("/{base_topic}_R{}", worker_id + 1);
-        let Ok(subscriber) = node.subscribe::<r2r::std_msgs::msg::String>(
-            &topic,
-            QosProfile::default(),
-        ) else {
-            eprintln!("failed to subscribe to trust monitor reconfig topic {topic}");
+        let Ok(subscriber) =
+            node.subscribe::<r2r::std_msgs::msg::String>(&topic, QosProfile::default())
+        else {
+            eprintln!("failed to subscribe to TC reconfiguration topic {topic}");
             continue;
         };
         let assignments = Arc::clone(&assignments);
@@ -233,12 +236,12 @@ fn run_trust_monitor_reconfig_listener(
                 })
                 .await;
         }) {
-            eprintln!("failed to spawn trust monitor reconfig task for {topic}: {err}");
+            eprintln!("failed to spawn TC reconfiguration task for {topic}: {err}");
         }
     }
 
-    for _ in 0..TRUST_MONITOR_DISCOVERY_SPINS {
-        node.spin_once(TRUST_MONITOR_DISCOVERY_SPIN_INTERVAL);
+    for _ in 0..TC_DISCOVERY_SPINS {
+        node.spin_once(TC_DISCOVERY_SPIN_INTERVAL);
         pool.run_until_stalled();
     }
 
@@ -255,18 +258,18 @@ fn apply_reconfig_payload(
     worker_id: usize,
     robots: usize,
     payload: &str,
-    assignments: &Arc<Mutex<Vec<Vec<HighlightQuadrant>>>>,
-    sender: &mpsc::Sender<Vec<Vec<HighlightQuadrant>>>,
+    assignments: &Arc<Mutex<TcAssignments>>,
+    sender: &mpsc::Sender<TcAssignments>,
 ) {
     let worker_quadrants = reconfig_payload_quadrants(payload);
     if worker_quadrants.is_empty() {
         eprintln!(
-            "INFO trust monitor reconfig: R{} received no machine property",
+            "INFO TC reconfiguration: R{} received no machine property",
             worker_id + 1
         );
     } else {
         eprintln!(
-            "INFO trust monitor reconfig: R{} is monitoring {:?}",
+            "INFO TC reconfiguration: R{} is monitoring {:?}",
             worker_id + 1,
             worker_quadrants
         );
@@ -283,11 +286,14 @@ fn apply_reconfig_payload(
         return;
     }
     *assignment = worker_quadrants;
-    let mut monitored = assignments.clone();
-    monitored.resize_with(robots, Vec::new);
-    let active = monitored.iter().filter(|quadrants| !quadrants.is_empty()).count();
-    eprintln!("INFO trust monitor active highlighted workers: {active}");
-    let _ = sender.send(monitored);
+    let mut updated_assignments = assignments.clone();
+    updated_assignments.resize_with(robots, Vec::new);
+    let active = updated_assignments
+        .iter()
+        .filter(|quadrants| !quadrants.is_empty())
+        .count();
+    eprintln!("INFO TC assignments highlight {active} active workers");
+    let _ = sender.send(updated_assignments);
 }
 
 fn reconfig_payload_quadrants(payload: &str) -> Vec<HighlightQuadrant> {
@@ -306,10 +312,10 @@ fn reconfig_payload_quadrants(payload: &str) -> Vec<HighlightQuadrant> {
         let Some((variable, _)) = rest.split_once(':') else {
             continue;
         };
-        if let Some(quadrant) = monitored_property_quadrant(variable.trim()) {
-            if !quadrants.contains(&quadrant) {
-                quadrants.push(quadrant);
-            }
+        if let Some(quadrant) = monitored_property_quadrant(variable.trim())
+            && !quadrants.contains(&quadrant)
+        {
+            quadrants.push(quadrant);
         }
     }
 

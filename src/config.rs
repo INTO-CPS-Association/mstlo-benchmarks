@@ -37,6 +37,12 @@ pub struct Args {
     #[arg(long)]
     pub robot_labels: bool,
 
+    #[arg(
+        long,
+        help = "Use larger markers and labels for screenshots and presentations."
+    )]
+    pub screenshot: bool,
+
     #[arg(long, default_value_t = 1.5, value_parser = positive_f32)]
     pub wall_avoidance_margin: f32,
 
@@ -84,6 +90,21 @@ pub struct Args {
 
     #[arg(long = "trustworthiness-checker-rust-log", default_value = "warn")]
     pub trustworthiness_checker_rust_log: String,
+
+    #[arg(long = "benchmark-duration-secs", value_parser = positive_f32)]
+    pub benchmark_duration_secs: Option<f32>,
+
+    #[arg(long = "benchmark-warmup-secs", default_value_t = 0.0, value_parser = non_negative_f32)]
+    pub benchmark_warmup_secs: f32,
+
+    #[arg(
+        long = "benchmark-output-dir",
+        default_value = "target/scalability-benchmarks/manual"
+    )]
+    pub benchmark_output_dir: PathBuf,
+
+    #[arg(long = "benchmark-run-id")]
+    pub benchmark_run_id: Option<String>,
 }
 
 fn positive_f32(value: &str) -> Result<f32, String> {

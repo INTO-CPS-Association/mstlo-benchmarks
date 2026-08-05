@@ -1,15 +1,17 @@
+mod benchmark;
 mod config;
 mod rendering;
 mod robot;
 mod ros;
 mod simulation;
+mod telemetry;
 mod trustworthiness_checker;
 
 use bevy::prelude::*;
 use clap::Parser;
 use config::Args;
 use robot::RobotPosition;
-use ros::{RosBridge, RosBridgeHandle, TrustMonitorState, start_trust_monitor_reconfig_listener};
+use ros::{RosBridge, RosBridgeHandle, TcAssignmentState, start_tc_reconfiguration_listener};
 use simulation::{SimulationConfig, SimulationRng};
 use tokio::sync::mpsc;
 use trustworthiness_checker::TrustworthinessCheckerProcesses;
@@ -17,9 +19,21 @@ use trustworthiness_checker::TrustworthinessCheckerProcesses;
 fn main() {
     let args = Args::parse();
     let sim_config = SimulationConfig::from(args.clone());
+    if args.benchmark_duration_secs.is_some() {
+        if let Err(err) = benchmark::run(args, sim_config) {
+            eprintln!("benchmark failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     eprintln!(
-        "INFO simulation config: robots={}, robot_labels={}, arena={}x{}",
-        sim_config.robots, sim_config.robot_labels, sim_config.arena_width, sim_config.arena_height
+        "INFO simulation config: robots={}, robot_labels={}, screenshot={}, arena={}x{}",
+        sim_config.robots,
+        sim_config.robot_labels,
+        sim_config.screenshot,
+        sim_config.arena_width,
+        sim_config.arena_height
     );
     let (position_sender, position_receiver) = mpsc::channel::<Vec<RobotPosition>>(4);
 
@@ -34,18 +48,18 @@ fn main() {
             }
         }
     };
-    let trust_monitor_listener = if args.no_ros {
+    let tc_listener = if args.no_ros {
         None
     } else {
-        match start_trust_monitor_reconfig_listener(sim_config.clone()) {
+        match start_tc_reconfiguration_listener(sim_config.clone()) {
             Ok(listener) => Some(listener),
             Err(err) => {
-                eprintln!("trust monitor reconfig listener disabled: {err}");
+                eprintln!("trustworthiness checker reconfiguration listener disabled: {err}");
                 None
             }
         }
     };
-    let (trust_monitor_updates, trust_monitor_worker) = trust_monitor_listener
+    let (tc_updates, tc_worker) = tc_listener
         .map(|(receiver, worker)| (Some(receiver), Some(worker)))
         .unwrap_or((None, None));
 
@@ -64,16 +78,20 @@ fn main() {
         .insert_resource(RosBridgeHandle {
             sender: position_sender,
             _worker: ros_handle,
-            trust_monitor_updates,
-            _trust_monitor_worker: trust_monitor_worker,
+            tc_updates,
+            _tc_worker: tc_worker,
         })
-        .insert_resource(TrustMonitorState::new(sim_config.robots))
+        .insert_resource(TcAssignmentState::new(sim_config.robots))
         .insert_resource(trustworthiness_checker_processes)
         .insert_resource(Time::<Fixed>::from_hz(sim_config.sim_hz as f64))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Robot Brownian Simulation".to_string(),
-                resolution: (1100, 800).into(),
+                resolution: if sim_config.screenshot {
+                    (1400, 1100).into()
+                } else {
+                    (1100, 800).into()
+                },
                 ..default()
             }),
             ..default()
