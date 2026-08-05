@@ -1,0 +1,19 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "extraEnv": {
+            "ROS_VERSION": "2",
+            "ROS_PYTHON_VERSION": "3",
+            "ROS_DISTRO": "jazzy",
+            "AMENT_PREFIX_PATH": "/opt/ros/jazzy",
+            "CMAKE_PREFIX_PATH": "/opt/ros/jazzy/opt/gz_math_vendor:/opt/ros/jazzy/opt/gz_utils_vendor:/opt/ros/jazzy/opt/gz_cmake_vendor",
+            "PYTHONPATH": "/opt/ros/jazzy/lib/python3.12/site-packages",
+            "LD_LIBRARY_PATH": "/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib"
+          }
+        }
+      }
+    }
+  }
+}

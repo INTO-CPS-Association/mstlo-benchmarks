@@ -1,0 +1,20 @@
+- property_1: "conveyor_system"
+  topic_name: "ConveyorSystem"
+  topic_type: "Int32"
+  start_value: 10
+  modify: "stoch_inc_dec 0.5"
+- property_2: "stacker_crane"
+  topic_name: "StackerCrane"
+  topic_type: "Int32"
+  start_value: 15
+  modify: "stoch_inc_dec 0.5"
+- property_3: "vertical_lift"
+  topic_name: "VerticalLift"
+  topic_type: "Int32"
+  start_value: 30
+  modify: "increment"
+- property_4: "horizontal_carousel"
+  topic_name: "HorizontalCarousel"
+  topic_type: "Int32"
+  start_value: 1
+  modify: "stoch_inc 0.05"

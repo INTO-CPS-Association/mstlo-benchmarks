@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+
+# Trustworthiness-checker generated run output, if redirected outside target
+/trust-checker/
+/trustworthiness-checker/
+/logs/
+
+# Local agent/tool state
+/.agents/
+/.codex/
+
+# Editor and OS noise
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Runtime byproducts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log
+*.pid
+core
