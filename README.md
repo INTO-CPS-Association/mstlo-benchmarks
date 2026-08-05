@@ -65,7 +65,7 @@ ros2 topic echo /robot_0/pose2d
 ## Scalability benchmarks
 
 The headless benchmark mode exercises the same simulation, ROS publishing, and
-checker integration while writing JSONL telemetry:
+checker integration while writing JSONL data:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -78,7 +78,7 @@ cargo run --release -- \
 ```
 
 The Python harness runs multi-size sweeps and produces Parquet summaries and
-plots. A short simulator-only smoke run is:
+plots. A short simulator-only run is:
 
 ```bash
 uv run benchmark-scalability \
