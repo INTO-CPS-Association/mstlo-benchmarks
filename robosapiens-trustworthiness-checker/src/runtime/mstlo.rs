@@ -219,14 +219,10 @@ pub trait MstloStreamValue: StreamData {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MstloRouting {
-    /// Preserve the historical behaviour. This is required for RoSI, whose
-    /// refinements expose repeated updates at the same timestamp, and for
-    /// formulas with no input signals, whose output cadence is the input
-    /// cadence.
+    /// Historical all-monitor routing, retained as a test oracle.
     FanOut,
-    /// Deliver every referenced sample and one additional sample per input
-    /// timestamp to keep temporal operators' clocks and synchronizer timelines
-    /// unchanged without evaluating every unrelated sample.
+    /// Deliver referenced samples and one clock sample per input timestamp.
+    /// Signal-free formulas retain the full input cadence separately.
     ReferencedWithClock,
 }
 
@@ -417,11 +413,7 @@ where
             let formulae = formulae.into_formulae();
             let algorithm = self.algorithm;
             let semantics = self.semantics;
-            let routing = if semantics == Semantics::RobustnessInterval {
-                MstloRouting::FanOut
-            } else {
-                MstloRouting::ReferencedWithClock
-            };
+            let routing = MstloRouting::ReferencedWithClock;
             let synchronization_strategy = self.synchronization_strategy;
             let variables = self.variables;
             let input_stream = self.input.expect("MSTLO input stream must be set");
@@ -914,12 +906,8 @@ where
                     }
                 } else {
                     if new_timestamp {
-                        // A temporal monitor must still observe the input
-                        // clock, and a multi-signal monitor's synchronizer
-                        // must still see every timestamp. One representative
-                        // step is enough; repeated unrelated steps at the
-                        // same timestamp do not add information for the
-                        // non-RoSI semantics.
+                        // Temporal monitors and synchronizers still need one
+                        // representative clock sample at every timestamp.
                         let relevant_ids = relevant_monitors.map_or(&[][..], Vec::as_slice);
                         let mut relevant_index = 0;
                         for &monitor_id in &self.clocked_monitors {
@@ -1352,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn rosi_and_signal_free_routes_keep_their_cadence_sensitive_behaviour() {
+    fn rosi_indexing_preserves_final_interval_and_signal_free_cadence() {
         let formula = parse_stl("(x > 0) && (z > 0)").unwrap();
         let trace = vec![
             Step::new("x", 2.0, Duration::ZERO),
@@ -1395,9 +1383,20 @@ mod tests {
                     .unwrap()
             },
         );
-        assert_ne!(
-            clocked, fanout,
-            "the RoSI route must not be assumed equivalent"
+        let latest = |outputs: Vec<MstloTimedValue>| {
+            outputs
+                .into_iter()
+                .map(|output| (output.timestamp, output.value))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            latest(clocked.clone()),
+            latest(fanout.clone()),
+            "indexed RoSI changed the final interval at a timestamp"
+        );
+        assert!(
+            clocked.len() < fanout.len(),
+            "indexed RoSI should remove redundant refinements"
         );
 
         let formula = MstloSpecification::single(VarName::new("out"), FormulaDefinition::True);

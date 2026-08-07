@@ -23,6 +23,22 @@ pub type RosMstloTimedValue = r2r::robo_sapiens_interfaces::msg::MstloTimedValue
 const FLOAT_KIND: u8 = 0;
 const BOOL_KIND: u8 = 1;
 const ROBUSTNESS_INTERVAL_KIND: u8 = 2;
+const INPUT_DEPTH: usize = 64;
+const OUTPUT_DEPTH: usize = 256;
+
+fn input_qos() -> r2r::QosProfile {
+    r2r::QosProfile::default()
+        .keep_last(INPUT_DEPTH)
+        .reliable()
+        .volatile()
+}
+
+fn output_qos() -> r2r::QosProfile {
+    r2r::QosProfile::default()
+        .keep_last(OUTPUT_DEPTH)
+        .reliable()
+        .volatile()
+}
 
 /// Convert a Rust duration to a ROS duration.
 pub fn duration_to_ros(
@@ -128,8 +144,7 @@ pub fn input_stream(
     let mut streams: Vec<OutputStream<anyhow::Result<(VarName, MstloTimedValue)>>> = Vec::new();
     for (variable, (topic, _)) in mapping {
         let variable = VarName::new(&variable);
-        let subscription =
-            node.subscribe::<RosMstloTimedValue>(&topic, r2r::QosProfile::default())?;
+        let subscription = node.subscribe::<RosMstloTimedValue>(&topic, input_qos())?;
         let stream = Box::pin(subscription.map(move |message| {
             let value = mstlo_value_from_ros(&message).with_context(|| {
                 format!("invalid MstloTimedValue received for variable `{variable}`")
@@ -253,7 +268,7 @@ impl MstloRosOutputHandler {
                 anyhow::anyhow!("ROS output mapping is missing topic for `{variable}`")
             })?;
             let publisher = node
-                .create_publisher::<RosMstloTimedValue>(&topic, r2r::QosProfile::default())
+                .create_publisher::<RosMstloTimedValue>(&topic, output_qos())
                 .map_err(|error| anyhow::anyhow!(error))
                 .with_context(|| format!("failed to create MSTLO ROS publisher for `{topic}`"))?;
             tasks.push(Box::pin(Self::publish_stream(topic, stream, publisher)));

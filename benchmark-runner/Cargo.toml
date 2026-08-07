@@ -1,0 +1,29 @@
+[package]
+name = "mstlo-benchmark-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+ros = ["dep:r2r"]
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+futures = "0.3.32"
+
+mstlo = "0.1.1"
+r2r = { version = "0.9.5", optional = true }
+rand = "0.10.1"
+rand_chacha = "0.10.0"
+rand_distr = "0.6.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+smol = "2.0.2"
+trustworthiness_checker = { path = "../robosapiens-trustworthiness-checker", default-features = false }
+
+[profile.bench-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
