@@ -25,3 +25,15 @@ def test_ros_maps_match_runner_topics(tmp_path):
     assert '"MstloTimedValue"' in output_map.read_text()
     assert set(json.loads(output_map.read_text())) == {"dwell_0", "dwell_1"}
     assert signal_names(1) == ("robot_1_x", "robot_1_y")
+
+
+def test_ros_maps_apply_the_benchmark_namespace(tmp_path):
+    _, input_map, output_map = write_artefacts(
+        tmp_path, "occupancy", 2, 10, 5, "mstlo_bench_run123"
+    )
+    inputs = json.loads(input_map.read_text())
+    outputs = json.loads(output_map.read_text())
+    assert inputs["robot_1_y"]["topic"] == "/mstlo_bench_run123/mstlo/robot_1/y"
+    assert outputs["occupancy_vertical_lift"]["topic"] == (
+        "/mstlo_bench_run123/mstlo/verdict/occupancy_vertical_lift"
+    )

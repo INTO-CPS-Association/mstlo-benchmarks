@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import itertools
 import json
 import os
-import shutil
 import signal
 import subprocess
 import time
 import tomllib
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,7 +19,6 @@ from .collect import append_result
 from .progress import (
     expected_progress_seconds,
     format_progress_label,
-    progress_line_width,
     run_with_progress,
 )
 from .properties import semantic_horizon_ms, write_artefacts
@@ -26,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER_DIR = ROOT / "benchmark-runner"
 CHECKER_DIR = ROOT / "robosapiens-trustworthiness-checker"
 PROFILE = "bench-fast"
+MAX_RETRIES = 5
 
 
 @dataclass(frozen=True)
@@ -99,7 +102,14 @@ def load_config(path: Path) -> Config:
 
 
 def run(config_path: Path, output_dir: Path) -> list[dict[str, Any]]:
+    with _output_lock(output_dir):
+        return _run_locked(config_path, output_dir)
+
+
+def _run_locked(config_path: Path, output_dir: Path) -> list[dict[str, Any]]:
     config = load_config(config_path)
+    topic_namespace = f"mstlo_bench_{uuid.uuid4().hex}"
+    _snapshot_config(config_path, output_dir)
     _build("ros" in config.transports)
     points = [
         Point(*values)
@@ -127,40 +137,31 @@ def run(config_path: Path, output_dir: Path) -> list[dict[str, Any]]:
         for point in points
     )
     seconds_width = len(f"{maximum_seconds:.1f}")
-    line_width = progress_line_width(
-        label_width,
-        seconds_width,
-        terminal_width=shutil.get_terminal_size(fallback=(80, 20)).columns,
-    )
 
     print(f"Running {total} benchmark points into {output_dir}", flush=True)
     rows = []
     for index, point in enumerate(points, 1):
-        try:
-            row = run_with_progress(
-                point,
-                index,
-                total,
-                duration_s=config.duration_s,
-                settle_s=config.checker_settle_s,
-                warmup_s=config.discovery_s,
-                drain_s=config.drain_s,
-                label_width=label_width,
-                seconds_width=seconds_width,
-                line_width=line_width,
-                runner=lambda point=point: _run_point(point, config, output_dir),
-            )
-        except Exception as error:
-            row = {
-                "robots": point.robots,
-                "seed": point.seed,
-                "property_set": point.property_set,
-                "transport": point.transport,
-                "semantics": point.semantics,
-                "algorithm": config.algorithm,
-                "ok": False,
-                "error": str(error),
-            }
+
+        def attempt(point: Point = point, index: int = index) -> dict[str, Any]:
+            try:
+                return run_with_progress(
+                    point,
+                    index,
+                    total,
+                    duration_s=config.duration_s,
+                    settle_s=config.checker_settle_s,
+                    warmup_s=config.discovery_s,
+                    drain_s=config.drain_s,
+                    label_width=label_width,
+                    seconds_width=seconds_width,
+                    runner=lambda: _run_point(
+                        point, config, output_dir, topic_namespace
+                    ),
+                )
+            except Exception as error:
+                return _failure_row(point, config, str(error))
+
+        row = run_attempts(attempt)
         append_result(output_dir, row)
         rows.append(row)
         if row["ok"]:
@@ -168,6 +169,70 @@ def run(config_path: Path, output_dir: Path) -> list[dict[str, Any]]:
         else:
             print(f"  failed: {row['error']}")
     return rows
+
+
+def run_attempts(
+    attempt: Callable[[], dict[str, Any]], max_retries: int = MAX_RETRIES
+) -> dict[str, Any]:
+    """Retry a benchmark point until it succeeds, at most `max_retries` times.
+
+    ROS points fail intermittently under load, so a failed attempt is repeated
+    instead of leaving a gap in the sweep. Only the final row is kept, and its
+    `attempts` field records how many runs it took.
+    """
+    row: dict[str, Any] = {}
+    for number in range(1, max_retries + 2):
+        row = attempt()
+        row["attempts"] = number
+        if row["ok"]:
+            break
+        if number <= max_retries:
+            print(f"  retry {number}/{max_retries} after: {row['error']}")
+    return row
+
+
+def _failure_row(point: Point, config: Config, error: str) -> dict[str, Any]:
+    return {
+        "robots": point.robots,
+        "seed": point.seed,
+        "property_set": point.property_set,
+        "transport": point.transport,
+        "semantics": point.semantics,
+        "algorithm": config.algorithm,
+        "ok": False,
+        "error": error,
+    }
+
+
+@contextmanager
+def _output_lock(output_dir: Path) -> Iterator[None]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / ".benchmark.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"another benchmark is already writing to {output_dir}"
+            ) from error
+        lock.seek(0)
+        lock.truncate()
+        lock.write(f"pid={os.getpid()}\n")
+        lock.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _snapshot_config(config_path: Path, output_dir: Path) -> None:
+    snapshot = output_dir / "config.toml"
+    contents = config_path.read_bytes()
+    results = output_dir / "results.jsonl"
+    if snapshot.exists() and snapshot.read_bytes() != contents and results.exists():
+        raise ValueError(f"{output_dir} contains results for a different config")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot.write_bytes(contents)
 
 
 def _build(needs_ros: bool) -> None:
@@ -202,7 +267,12 @@ def _build(needs_ros: bool) -> None:
     _check(["cargo", "build", "--profile", PROFILE, *features], RUNNER_DIR)
 
 
-def _run_point(point: Point, config: Config, output_dir: Path) -> dict[str, Any]:
+def _run_point(
+    point: Point,
+    config: Config,
+    output_dir: Path,
+    topic_namespace: str,
+) -> dict[str, Any]:
     run_dir = output_dir / "work" / point.name()
     properties, input_map, output_map = write_artefacts(
         run_dir,
@@ -210,6 +280,7 @@ def _run_point(point: Point, config: Config, output_dir: Path) -> dict[str, Any]
         point.robots,
         config.window_s,
         config.dwell_s,
+        topic_namespace,
     )
     horizon_ms = semantic_horizon_ms(
         point.property_set,
@@ -247,6 +318,7 @@ def _run_point(point: Point, config: Config, output_dir: Path) -> dict[str, Any]
             output_map,
             point.semantics,
             config.algorithm,
+            topic_namespace,
         )
     return {
         "robots": point.robots,
@@ -289,6 +361,7 @@ def _run_ros(
     output_map: Path,
     semantics: str,
     algorithm: str,
+    topic_namespace: str,
 ) -> dict[str, Any]:
     checker_log = (run_dir / "checker.log").open("wb")
     checker = subprocess.Popen(
@@ -322,6 +395,8 @@ def _run_ros(
                 *common,
                 "--output-map",
                 str(output_map),
+                "--topic-namespace",
+                topic_namespace,
                 "--discovery-s",
                 str(config.discovery_s),
                 "--drain-s",

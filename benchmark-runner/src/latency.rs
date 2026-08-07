@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, time::Instant};
 use serde::Serialize;
 use trustworthiness_checker::VarName;
 
-const MISSING: u64 = u64::MAX;
+const MISSING: i64 = i64::MIN;
 
 #[derive(Clone, Copy)]
 struct Publication {
@@ -13,11 +13,12 @@ struct Publication {
 
 pub struct LatencyTracker {
     started: Instant,
-    horizon_ns: u64,
+    finalization_horizon_ns: u64,
+    latency_baseline_ns: u64,
     publications: Vec<Publication>,
     property_ids: BTreeMap<VarName, usize>,
     property_count: usize,
-    latencies: Vec<u64>,
+    latencies: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -31,8 +32,24 @@ pub struct LatencySummary {
     pub latency_overhead_ms_p99: Option<f64>,
 }
 
+impl LatencySummary {
+    /// Whether at least `minimum_percent` of the expected property/timestamp
+    /// verdicts arrived. A run with no expected verdicts never qualifies.
+    pub fn meets_completeness(&self, minimum_percent: u64) -> bool {
+        self.latency_expected_samples > 0
+            && self.latency_samples.saturating_mul(100)
+                >= self
+                    .latency_expected_samples
+                    .saturating_mul(minimum_percent)
+    }
+}
+
 impl LatencyTracker {
-    pub fn new(horizon_ms: u64, properties: impl IntoIterator<Item = VarName>) -> Self {
+    pub fn new(
+        finalization_horizon_ms: u64,
+        latency_baseline_ms: u64,
+        properties: impl IntoIterator<Item = VarName>,
+    ) -> Self {
         let property_ids: BTreeMap<_, _> = properties
             .into_iter()
             .enumerate()
@@ -41,7 +58,8 @@ impl LatencyTracker {
         let property_count = property_ids.len();
         Self {
             started: Instant::now(),
-            horizon_ns: horizon_ms.saturating_mul(1_000_000),
+            finalization_horizon_ns: finalization_horizon_ms.saturating_mul(1_000_000),
+            latency_baseline_ns: latency_baseline_ms.saturating_mul(1_000_000),
             publications: Vec::new(),
             property_ids,
             property_count,
@@ -82,11 +100,11 @@ impl LatencyTracker {
             return;
         }
         let published_ns = self.publications[timestamp_index].elapsed_ns;
-        let latency_ns = self
-            .elapsed_ns()
-            .saturating_sub(published_ns)
-            .saturating_sub(self.horizon_ns);
-        self.latencies[slot] = latency_ns;
+        let elapsed_ns = self.elapsed_ns().saturating_sub(published_ns);
+        self.latencies[slot] = elapsed_ns
+            .saturating_sub(self.latency_baseline_ns)
+            .try_into()
+            .unwrap_or(i64::MAX);
     }
 
     pub fn summary(&mut self, invalid_outputs: u64) -> LatencySummary {
@@ -121,10 +139,10 @@ impl LatencyTracker {
         let Some(last) = self.publications.last() else {
             return 0;
         };
-        if last.timestamp_ns < self.horizon_ns {
+        if last.timestamp_ns < self.finalization_horizon_ns {
             return 0;
         }
-        let last_output_timestamp = last.timestamp_ns - self.horizon_ns;
+        let last_output_timestamp = last.timestamp_ns - self.finalization_horizon_ns;
         self.publications
             .partition_point(|entry| entry.timestamp_ns <= last_output_timestamp)
     }
@@ -145,7 +163,7 @@ mod tests {
     #[test]
     fn tracker_keeps_only_the_first_verdict_per_property_and_timestamp() {
         let property = VarName::new("p");
-        let mut tracker = LatencyTracker::new(0, [property.clone()]);
+        let mut tracker = LatencyTracker::new(0, 0, [property.clone()]);
         tracker.record_input(0);
         let property_id = tracker.property_id(&property).unwrap();
         tracker.record_output(property_id, 0);
@@ -157,8 +175,49 @@ mod tests {
     }
 
     #[test]
+    fn tracker_separates_finalization_horizon_from_latency_baseline() {
+        let property = VarName::new("p");
+        let mut tracker = LatencyTracker::new(1_000, 0, [property.clone()]);
+        tracker.record_input(0);
+        tracker.record_output(tracker.property_id(&property).unwrap(), 0);
+        tracker.record_input(1_000_000_000);
+        let summary = tracker.summary(0);
+        assert_eq!(summary.latency_expected_samples, 1);
+        assert!(summary.latency_overhead_ms_p50.unwrap() >= 0.0);
+    }
+
+    fn summary_with(samples: u64, expected_samples: u64) -> LatencySummary {
+        LatencySummary {
+            latency_samples: samples,
+            latency_expected_samples: expected_samples,
+            latency_complete: samples == expected_samples,
+            latency_invalid_outputs: 0,
+            latency_overhead_ms_p50: None,
+            latency_overhead_ms_p95: None,
+            latency_overhead_ms_p99: None,
+        }
+    }
+
+    #[test]
+    fn summary_meets_completeness_at_the_threshold() {
+        assert!(summary_with(18_000, 20_000).meets_completeness(90));
+        assert!(summary_with(20_000, 20_000).meets_completeness(90));
+    }
+
+    #[test]
+    fn summary_misses_completeness_below_the_threshold() {
+        assert!(!summary_with(17_999, 20_000).meets_completeness(90));
+        assert!(!summary_with(0, 20_000).meets_completeness(90));
+    }
+
+    #[test]
+    fn summary_without_expected_verdicts_never_meets_completeness() {
+        assert!(!summary_with(0, 0).meets_completeness(90));
+    }
+
+    #[test]
     fn tracker_payload_is_eight_bytes_per_property_timestamp() {
         assert_eq!(std::mem::size_of::<Publication>(), 16);
-        assert_eq!(std::mem::size_of::<u64>(), 8);
+        assert_eq!(std::mem::size_of::<i64>(), 8);
     }
 }

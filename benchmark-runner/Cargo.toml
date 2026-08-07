@@ -21,6 +21,7 @@ rand_distr = "0.6.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 smol = "2.0.2"
+tikv-jemallocator = "0.6.1"
 trustworthiness_checker = { path = "../robosapiens-trustworthiness-checker", default-features = false }
 
 [profile.bench-fast]

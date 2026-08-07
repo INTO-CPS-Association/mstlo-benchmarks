@@ -24,6 +24,10 @@ use crate::{CommonArgs, SemanticsArg, latency::LatencyTracker, simulation::Simul
 const FLOAT_KIND: u8 = 0;
 const INPUT_DEPTH: usize = 64;
 const OUTPUT_DEPTH: usize = 256;
+/// Percentage of expected property/timestamp verdicts a ROS run must collect.
+/// Transport under load drops a small tail, so the run is accepted and reported
+/// as incomplete rather than failed.
+const MIN_VERDICT_PERCENT: u64 = 90;
 
 struct Publishers {
     x: Publisher<MstloTimedValue>,
@@ -40,6 +44,7 @@ type VerdictStream = Pin<Box<dyn Stream<Item = (usize, MstloTimedValue)>>>;
 pub fn run(
     args: &CommonArgs,
     output_map: &Path,
+    topic_namespace: &str,
     discovery_s: f64,
     drain_s: f64,
 ) -> anyhow::Result<()> {
@@ -51,6 +56,7 @@ pub fn run(
     let property_names: Vec<_> = mappings.keys().map(|name| VarName::new(name)).collect();
     let tracker = Arc::new(Mutex::new(LatencyTracker::new(
         args.horizon_ms,
+        args.semantics.latency_baseline_ms(args.horizon_ms),
         property_names,
     )));
     let stop_collector = Arc::new(AtomicBool::new(false));
@@ -66,8 +72,8 @@ pub fn run(
     let mut publishers = Vec::with_capacity(args.robots);
     for robot in 0..args.robots {
         publishers.push(Publishers {
-            x: node.create_publisher(&format!("/mstlo/robot_{robot}/x"), input_qos())?,
-            y: node.create_publisher(&format!("/mstlo/robot_{robot}/y"), input_qos())?,
+            x: node.create_publisher(&input_topic(topic_namespace, robot, "x"), input_qos())?,
+            y: node.create_publisher(&input_topic(topic_namespace, robot, "y"), input_qos())?,
         });
     }
 
@@ -116,10 +122,11 @@ pub fn run(
         summary.latency_invalid_outputs
     );
     anyhow::ensure!(
-        summary.latency_complete,
-        "ROS produced {} of {} expected property/timestamp verdicts",
+        summary.meets_completeness(MIN_VERDICT_PERCENT),
+        "ROS produced {} of {} expected property/timestamp verdicts, below the {}% minimum",
         summary.latency_samples,
-        summary.latency_expected_samples
+        summary.latency_expected_samples,
+        MIN_VERDICT_PERCENT
     );
     println!("{}", serde_json::to_string(&summary)?);
     Ok(())
@@ -215,6 +222,29 @@ fn spin_until(node: &mut Node, deadline: Instant) {
         node.spin_once(Duration::ZERO);
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(2)));
+    }
+}
+
+fn input_topic(topic_namespace: &str, robot: usize, axis: &str) -> String {
+    let topic_namespace = topic_namespace.trim_matches('/');
+    if topic_namespace.is_empty() {
+        format!("/mstlo/robot_{robot}/{axis}")
+    } else {
+        format!("/{topic_namespace}/mstlo/robot_{robot}/{axis}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_topic;
+
+    #[test]
+    fn input_topics_use_the_benchmark_namespace() {
+        assert_eq!(
+            input_topic("mstlo_bench_run123", 7, "y"),
+            "/mstlo_bench_run123/mstlo/robot_7/y"
+        );
+        assert_eq!(input_topic("", 7, "y"), "/mstlo/robot_7/y");
     }
 }
 

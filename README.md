@@ -5,12 +5,12 @@ This repository compares MSTLO latency with an in-process direct input path and 
 The reported metric is latency overhead:
 
 ```text
-first valid verdict arrival - source publication - property semantic horizon
+first valid verdict arrival - earliest time the semantics permits a verdict
 ```
 
-There is one sample for each property and logical timestamp. Later RoSI refinements at the same property/timestamp are ignored, so all semantics have the same weighting. The report shows the median, p95, and p99 of these samples; lower is better. A run fails if any expected property/timestamp verdict is missing or has the wrong payload type.
+There is one sample for each property and logical timestamp. Later RoSI refinements at the same property/timestamp are ignored, so all semantics have the same weighting. Delayed semantics exclude their required waiting period; eager and robustness-interval semantics have no fixed wait. The report shows the median, p95, and p99; lower is better. A run fails if any verdict has the wrong payload type. A direct run also fails if any expected verdict is missing. A ROS run is accepted once 90% of the expected verdicts arrive and is marked incomplete when some are missing.
 
-Direct hosts the checker in the runner process. ROS publishes to a standalone checker and collects verdicts in the same Rust source process. ROS uses reliable, volatile, bounded `KEEP_LAST` queues: depth 64 for inputs and 256 for verdicts.
+Direct and ROS use the same simulator, seed, scalar input events, properties, algorithm, semantics, synchronization, and publication schedule. Direct hosts the checker in the runner process. ROS publishes to a standalone checker and collects verdicts in the source process, so its latency additionally includes ROS input and output transport. ROS uses reliable, volatile, bounded `KEEP_LAST` queues: depth 64 for inputs and 256 for verdicts. Each benchmark invocation uses a unique ROS topic namespace, preventing concurrently running sweeps from exchanging inputs or verdicts.
 
 ## Run
 
@@ -29,7 +29,7 @@ uv run mstlo-bench benchmark --config configs/benchmark.toml --output-dir result
 uv run mstlo-bench report --output-dir results/run
 ```
 
-The TOML config defines robot counts, seeds, workloads, transports, semantics, rates, durations, and ROS settling times. `configs/overnight.toml` is a ten-seed direct/ROS sweep through 1,000 robots. Each point uses the fixed-width progress display with settle, warmup, measure, and analysis phases. Results are appended to `results.jsonl`. The report contains only:
+The TOML config defines robot counts, seeds, workloads, transports, semantics, rates, durations, and ROS settling times. `configs/overnight.toml` is a ten-seed direct/ROS sweep through 1,000 robots. Each point uses the fixed-width progress display with settle, warmup, measure, and analysis phases. A failed point is retried up to five times before the sweep records it as failed; only the final attempt is appended, with an `attempts` count. Results are appended to `results.jsonl`; a result directory is locked for the duration of a sweep so concurrent writers fail immediately instead of corrupting or cross-contaminating a run. Reports mark unrun, unconfigured, and partial series. A robot count is plotted only after every configured seed succeeds, so missing data remains a gap rather than a misleading line. The report contains only:
 
 - `latency.csv`
 - `latency.md`

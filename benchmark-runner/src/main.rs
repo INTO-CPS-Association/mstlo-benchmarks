@@ -28,6 +28,9 @@ use trustworthiness_checker::{
 
 use simulation::{Position, Simulation};
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -43,6 +46,8 @@ enum Command {
         common: CommonArgs,
         #[arg(long)]
         output_map: PathBuf,
+        #[arg(long, default_value = "")]
+        topic_namespace: String,
         #[arg(long, default_value_t = 2.0)]
         discovery_s: f64,
         #[arg(long, default_value_t = 2.0)]
@@ -59,6 +64,13 @@ enum SemanticsArg {
 }
 
 impl SemanticsArg {
+    fn latency_baseline_ms(self, finalization_horizon_ms: u64) -> u64 {
+        match self {
+            Self::EagerQualitative | Self::RobustnessInterval => 0,
+            Self::DelayedQualitative | Self::DelayedQuantitative => finalization_horizon_ms,
+        }
+    }
+
     fn accepts(self, value: MstloValue) -> bool {
         match (self, value) {
             (Self::DelayedQuantitative, MstloValue::Float(_)) => true,
@@ -123,9 +135,10 @@ fn main() -> anyhow::Result<()> {
         Command::Ros {
             common,
             output_map,
+            topic_namespace,
             discovery_s,
             drain_s,
-        } => ros::run(&common, &output_map, discovery_s, drain_s),
+        } => ros::run(&common, &output_map, &topic_namespace, discovery_s, drain_s),
     }
 }
 
@@ -184,7 +197,7 @@ struct Source {
     index: usize,
     samples: usize,
     rate: f64,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 fn run_direct(args: &CommonArgs) -> anyhow::Result<()> {
@@ -193,6 +206,7 @@ fn run_direct(args: &CommonArgs) -> anyhow::Result<()> {
     let model = parse_named_properties(&properties)?;
     let tracker = Rc::new(RefCell::new(LatencyTracker::new(
         args.horizon_ms,
+        args.semantics.latency_baseline_ms(args.horizon_ms),
         model.formulae().keys().cloned(),
     )));
     let source = Source {
@@ -213,7 +227,7 @@ fn run_direct(args: &CommonArgs) -> anyhow::Result<()> {
         index: 0,
         samples: (args.duration_s * args.publish_rate_hz).ceil() as usize,
         rate: args.publish_rate_hz,
-        started: Instant::now(),
+        started: None,
     };
     let input: InputStream<MstloTimedValue> =
         Box::pin(stream::unfold(source, |mut source| async move {
@@ -222,7 +236,8 @@ fn run_direct(args: &CommonArgs) -> anyhow::Result<()> {
                     return None;
                 }
                 source.timestamp = Duration::from_secs_f64(source.index as f64 / source.rate);
-                smol::Timer::at(source.started + source.timestamp).await;
+                let started = *source.started.get_or_insert_with(Instant::now);
+                smol::Timer::at(started + source.timestamp).await;
                 source.positions.clear();
                 source
                     .positions
@@ -248,7 +263,6 @@ fn run_direct(args: &CommonArgs) -> anyhow::Result<()> {
                 name,
                 MstloTimedValue::new(source.timestamp, MstloValue::Float(value)),
             );
-            smol::future::yield_now().await;
             Some((Ok(InputBatch::events(vec![event])), source))
         }));
 

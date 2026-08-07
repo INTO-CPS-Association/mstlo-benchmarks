@@ -63,6 +63,7 @@ def write_artefacts(
     robots: int,
     window_s: float,
     dwell_s: float,
+    topic_namespace: str = "",
 ) -> tuple[Path, Path, Path]:
     properties = build_properties(property_set, robots, window_s, dwell_s)
     directory.mkdir(parents=True, exist_ok=True)
@@ -71,15 +72,18 @@ def write_artefacts(
         "\n".join(f"{prop.name}: {prop.formula}" for prop in properties) + "\n",
         encoding="utf-8",
     )
+    topic_prefix = f"/{topic_namespace.strip('/')}" if topic_namespace else ""
     input_map = {
         signal: {
-            "topic": f"/mstlo/robot_{robot}/{axis}",
+            "topic": f"{topic_prefix}/mstlo/robot_{robot}/{axis}",
             "msg_type": "MstloTimedValue",
         }
         for robot in range(robots)
         for axis, signal in zip(("x", "y"), signal_names(robot))
     }
-    output_topics = {prop.name: f"/mstlo/verdict/{prop.name}" for prop in properties}
+    output_topics = {
+        prop.name: f"{topic_prefix}/mstlo/verdict/{prop.name}" for prop in properties
+    }
     output_map = {
         name: {"topic": topic, "msg_type": "MstloTimedValue"}
         for name, topic in output_topics.items()
