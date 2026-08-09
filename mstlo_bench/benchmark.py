@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .collect import append_result
+from .metadata import collect_metadata, update_metadata, utc_now, write_metadata
 from .progress import (
     expected_progress_seconds,
     format_progress_label,
@@ -24,9 +25,12 @@ from .progress import (
 from .properties import semantic_horizon_ms, write_artefacts
 from .ros import activate
 
-ROOT = Path(__file__).resolve().parents[1]
-RUNNER_DIR = ROOT / "benchmark-runner"
-CHECKER_DIR = ROOT / "robosapiens-trustworthiness-checker"
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("MSTLO_BENCH_ROOT", _SOURCE_ROOT))
+RUNNER_DIR = Path(os.environ.get("MSTLO_RUNNER_DIR", ROOT / "benchmark-runner"))
+CHECKER_DIR = Path(
+    os.environ.get("MSTLO_CHECKER_DIR", ROOT / "robosapiens-trustworthiness-checker")
+)
 PROFILE = "bench-fast"
 MAX_RETRIES = 5
 
@@ -101,74 +105,122 @@ def load_config(path: Path) -> Config:
     return config
 
 
-def run(config_path: Path, output_dir: Path) -> list[dict[str, Any]]:
+def run(
+    config_path: Path, output_dir: Path, *, resume: bool = False
+) -> list[dict[str, Any]]:
     with _output_lock(output_dir):
-        return _run_locked(config_path, output_dir)
+        return _run_locked(config_path, output_dir, resume=resume)
 
 
-def _run_locked(config_path: Path, output_dir: Path) -> list[dict[str, Any]]:
+def fresh_result_directory(results_root: Path, suite_name: str) -> Path:
+    """Create and return a unique directory for a new named suite run."""
+    results_root.mkdir(parents=True, exist_ok=True)
+    timestamp = utc_now().replace("-", "").replace(":", "").replace("+00:00", "")
+    timestamp = timestamp.replace("Z", "Z")
+    safe_name = (
+        "".join(
+            character if character.isalnum() or character in "-_" else "-"
+            for character in suite_name
+        ).strip("-")
+        or "benchmark"
+    )
+    for _ in range(10):
+        candidate = results_root / f"{safe_name}-{timestamp}-{uuid.uuid4().hex[:8]}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(
+        f"could not allocate a fresh result directory under {results_root}"
+    )
+
+
+def _run_locked(
+    config_path: Path, output_dir: Path, *, resume: bool = False
+) -> list[dict[str, Any]]:
     config = load_config(config_path)
-    topic_namespace = f"mstlo_bench_{uuid.uuid4().hex}"
-    _snapshot_config(config_path, output_dir)
-    _build("ros" in config.transports)
-    points = [
-        Point(*values)
-        for values in itertools.product(
-            config.robots,
-            config.seeds,
-            config.property_sets,
-            config.transports,
-            config.semantics,
-        )
-    ]
-    total = len(points)
-    label_width = max(
-        len(format_progress_label(index, total, point))
-        for index, point in enumerate(points, 1)
+    _prepare_output_directory(config_path, output_dir, resume=resume)
+    existing_metadata = output_dir / "metadata.json"
+    started_at = utc_now()
+    if resume and existing_metadata.exists():
+        try:
+            started_at = json.loads(existing_metadata.read_text(encoding="utf-8"))[
+                "started_at_utc"
+            ]
+        except (KeyError, json.JSONDecodeError):
+            raise ValueError(
+                f"{existing_metadata} is not valid benchmark metadata; start a fresh run"
+            ) from None
+    write_metadata(
+        output_dir,
+        collect_metadata(config_path, started_at_utc=started_at, status="running"),
     )
-    maximum_seconds = max(
-        expected_progress_seconds(
-            point,
-            config.duration_s,
-            config.checker_settle_s,
-            config.discovery_s,
-            config.drain_s,
+
+    rows: list[dict[str, Any]] = []
+    try:
+        topic_namespace = f"mstlo_bench_{uuid.uuid4().hex}"
+        _build("ros" in config.transports)
+        points = [
+            Point(*values)
+            for values in itertools.product(
+                config.robots,
+                config.seeds,
+                config.property_sets,
+                config.transports,
+                config.semantics,
+            )
+        ]
+        total = len(points)
+        label_width = max(
+            len(format_progress_label(index, total, point))
+            for index, point in enumerate(points, 1)
         )
-        for point in points
-    )
-    seconds_width = len(f"{maximum_seconds:.1f}")
+        maximum_seconds = max(
+            expected_progress_seconds(
+                point,
+                config.duration_s,
+                config.checker_settle_s,
+                config.discovery_s,
+                config.drain_s,
+            )
+            for point in points
+        )
+        seconds_width = len(f"{maximum_seconds:.1f}")
 
-    print(f"Running {total} benchmark points into {output_dir}", flush=True)
-    rows = []
-    for index, point in enumerate(points, 1):
+        print(f"Running {total} benchmark points into {output_dir}", flush=True)
+        for index, point in enumerate(points, 1):
 
-        def attempt(point: Point = point, index: int = index) -> dict[str, Any]:
-            try:
-                return run_with_progress(
-                    point,
-                    index,
-                    total,
-                    duration_s=config.duration_s,
-                    settle_s=config.checker_settle_s,
-                    warmup_s=config.discovery_s,
-                    drain_s=config.drain_s,
-                    label_width=label_width,
-                    seconds_width=seconds_width,
-                    runner=lambda: _run_point(
-                        point, config, output_dir, topic_namespace
-                    ),
-                )
-            except Exception as error:
-                return _failure_row(point, config, str(error))
+            def attempt(point: Point = point, index: int = index) -> dict[str, Any]:
+                try:
+                    return run_with_progress(
+                        point,
+                        index,
+                        total,
+                        duration_s=config.duration_s,
+                        settle_s=config.checker_settle_s,
+                        warmup_s=config.discovery_s,
+                        drain_s=config.drain_s,
+                        label_width=label_width,
+                        seconds_width=seconds_width,
+                        runner=lambda: _run_point(
+                            point, config, output_dir, topic_namespace
+                        ),
+                    )
+                except Exception as error:
+                    return _failure_row(point, config, str(error))
 
-        row = run_attempts(attempt)
-        append_result(output_dir, row)
-        rows.append(row)
-        if row["ok"]:
-            print(f"  p95 {row['latency_overhead_ms_p95']:.3f} ms")
-        else:
-            print(f"  failed: {row['error']}")
-    return rows
+            row = run_attempts(attempt)
+            append_result(output_dir, row)
+            rows.append(row)
+            if row["ok"]:
+                print(f"  p95 {row['latency_overhead_ms_p95']:.3f} ms")
+            else:
+                print(f"  failed: {row['error']}")
+        return rows
+    finally:
+        status = "success" if rows and all(row.get("ok") for row in rows) else "failed"
+        update_metadata(output_dir, status=status)
 
 
 def run_attempts(
@@ -225,6 +277,19 @@ def _output_lock(output_dir: Path) -> Iterator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _prepare_output_directory(
+    config_path: Path, output_dir: Path, *, resume: bool
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results = output_dir / "results.jsonl"
+    if results.exists() and not resume:
+        raise ValueError(
+            f"{output_dir} already contains results; choose a fresh output directory "
+            "or pass --resume explicitly"
+        )
+    _snapshot_config(config_path, output_dir)
+
+
 def _snapshot_config(config_path: Path, output_dir: Path) -> None:
     snapshot = output_dir / "config.toml"
     contents = config_path.read_bytes()
@@ -236,6 +301,15 @@ def _snapshot_config(config_path: Path, output_dir: Path) -> None:
 
 
 def _build(needs_ros: bool) -> None:
+    if _prebuilt_mode():
+        _validate_prebuilt(needs_ros)
+        if needs_ros:
+            activate(
+                CHECKER_DIR,
+                require_overlay=True,
+                overlay_setup=_ros_overlay_setup(),
+            )
+        return
     features: list[str] = []
     if needs_ros:
         activate(CHECKER_DIR, require_overlay=False)
@@ -338,7 +412,7 @@ def _run_point(
 def _run_direct(common: list[str], config: Config) -> dict[str, Any]:
     result = subprocess.run(
         [str(_runner_binary()), "direct", *common],
-        cwd=RUNNER_DIR,
+        cwd=RUNNER_DIR if RUNNER_DIR.is_dir() else _runner_binary().parent,
         capture_output=True,
         text=True,
         timeout=config.duration_s + 60,
@@ -381,7 +455,7 @@ def _run_ros(
             "--mstlo-synchronization",
             "zero-order-hold",
         ],
-        cwd=CHECKER_DIR,
+        cwd=CHECKER_DIR if CHECKER_DIR.is_dir() else run_dir,
         stdout=subprocess.DEVNULL,
         stderr=checker_log,
         start_new_session=True,
@@ -402,7 +476,7 @@ def _run_ros(
                 "--drain-s",
                 str(config.drain_s),
             ],
-            cwd=RUNNER_DIR,
+            cwd=RUNNER_DIR if RUNNER_DIR.is_dir() else run_dir,
             capture_output=True,
             text=True,
             timeout=config.duration_s + config.discovery_s + config.drain_s + 60,
@@ -437,9 +511,62 @@ def _stop(process: subprocess.Popen[Any], sig: signal.Signals) -> None:
             process.wait()
 
 
+def _prebuilt_mode() -> bool:
+    return os.environ.get("MSTLO_BENCH_PREBUILT", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _ros_overlay_setup() -> Path:
+    configured = os.environ.get("MSTLO_ROS_OVERLAY")
+    if configured:
+        path = Path(configured)
+        return path / "setup.bash" if path.is_dir() else path
+    return CHECKER_DIR / "ros_interfaces" / "install" / "setup.bash"
+
+
+def _validate_binary(path: Path, label: str) -> None:
+    if not path.is_file():
+        raise RuntimeError(
+            f"prebuilt {label} binary not found at {path}; set the corresponding "
+            "MSTLO_*_BIN environment variable or rebuild the image"
+        )
+    if not os.access(path, os.X_OK):
+        raise RuntimeError(f"prebuilt {label} binary is not executable: {path}")
+
+
+def _validate_prebuilt(needs_ros: bool) -> None:
+    _validate_binary(_runner_binary(), "runner")
+    if not needs_ros:
+        return
+    _validate_binary(_checker_binary(), "checker")
+    ros_setup = Path("/opt/ros") / os.environ.get("ROS_DISTRO", "jazzy") / "setup.bash"
+    if not ros_setup.is_file():
+        raise RuntimeError(f"ROS setup not found in prebuilt mode: {ros_setup}")
+    overlay_setup = _ros_overlay_setup()
+    if not overlay_setup.is_file():
+        raise RuntimeError(
+            f"prebuilt ROS setup for the interface overlay not found at {overlay_setup}; "
+            "set MSTLO_ROS_OVERLAY to its setup.bash or overlay directory"
+        )
+
+
 def _runner_binary() -> Path:
-    return RUNNER_DIR / "target" / PROFILE / "mstlo-benchmark-runner"
+    configured = os.environ.get("MSTLO_RUNNER_BIN")
+    return (
+        Path(configured)
+        if configured
+        else RUNNER_DIR / "target" / PROFILE / "mstlo-benchmark-runner"
+    )
 
 
 def _checker_binary() -> Path:
-    return CHECKER_DIR / "target" / PROFILE / "trustworthiness_checker"
+    configured = os.environ.get("MSTLO_CHECKER_BIN")
+    return (
+        Path(configured)
+        if configured
+        else CHECKER_DIR / "target" / PROFILE / "trustworthiness_checker"
+    )

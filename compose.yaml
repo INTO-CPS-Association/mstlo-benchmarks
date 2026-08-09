@@ -1,0 +1,26 @@
+services:
+  benchmark:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        ROS_DISTRO: jazzy
+        IMAGE_VERSION: ${MSTLO_BENCH_IMAGE_VERSION:-dev}
+        REPOSITORY_REVISION: ${MSTLO_BENCH_REPOSITORY_REVISION:-unknown}
+    init: true
+    shm_size: 1gb
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /opt/mstlo-bench
+    environment:
+      ROS_DISTRO: jazzy
+      ROS_LOCALHOST_ONLY: "1"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      MSTLO_BENCH_PREBUILT: "1"
+      MSTLO_BENCH_RESULTS_ROOT: /results
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    volumes:
+      - type: bind
+        source: ./results
+        target: /results

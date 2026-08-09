@@ -1,0 +1,77 @@
+# VCS, local environments, caches, and editor state
+.git
+.gitignore
+.venv
+.pytest_cache
+**/.pytest_cache
+**/__pycache__
+**/*.py[cod]
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/.coverage.*
+**/.DS_Store
+.vscode
+.zed
+.idea
+**/.vscode
+**/.zed
+
+# Rust and ROS build products
+**/target
+**/target/
+**/build
+**/build/
+**/install
+**/install/
+**/log
+**/log/
+**/compile_commands.json
+
+# Results, reports, and profiling output
+results
+results/
+**/results
+**/results/
+**/report
+**/report/
+**/reports
+**/reports/
+**/*.prof
+**/*.profraw
+**/*.lprof
+**/*.folded
+**/perf.data
+**/flamegraph.svg
+**/benchmark-results
+**/profiling
+
+# Development-only repository assets not used by this benchmark image
+multi-robot-runtime-verification
+robosapiens-trustworthiness-checker/.devcontainer
+robosapiens-trustworthiness-checker/.github
+robosapiens-trustworthiness-checker/.githooks
+robosapiens-trustworthiness-checker/.vscode
+robosapiens-trustworthiness-checker/.zed
+robosapiens-trustworthiness-checker/.vimspector.json
+robosapiens-trustworthiness-checker/docs
+robosapiens-trustworthiness-checker/examples
+robosapiens-trustworthiness-checker/fixtures
+
+robosapiens-trustworthiness-checker/tests
+robosapiens-trustworthiness-checker/proptest-regressions
+robosapiens-trustworthiness-checker/docker
+robosapiens-trustworthiness-checker/scripts
+robosapiens-trustworthiness-checker/integrations/fmu
+
+# The checker crate embeds these SVGs in Rust documentation at compile time.
+!robosapiens-trustworthiness-checker/docs/
+!robosapiens-trustworthiness-checker/docs/src/
+!robosapiens-trustworthiness-checker/docs/src/assets/
+!robosapiens-trustworthiness-checker/docs/src/assets/dataflow/
+!robosapiens-trustworthiness-checker/docs/src/assets/dataflow/*.svg
+
+# Top-level documentation is not needed at runtime; it remains in the source tree.
+README.md
+LICENSE.md
+ICA-USAGE-MODE.txt

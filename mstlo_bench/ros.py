@@ -11,10 +11,21 @@ IDL_PACKAGE_FILTER = (
 )
 
 
-def activate(checker_dir: Path, require_overlay: bool = True) -> None:
+def activate(
+    checker_dir: Path,
+    require_overlay: bool = True,
+    overlay_setup: Path | None = None,
+) -> None:
     distro = os.environ.get("ROS_DISTRO", "jazzy")
     setups = [Path("/opt/ros") / distro / "setup.bash"]
-    overlay = checker_dir / "ros_interfaces" / "install" / "setup.bash"
+    overlay = overlay_setup or Path(
+        os.environ.get(
+            "MSTLO_ROS_OVERLAY",
+            str(checker_dir / "ros_interfaces" / "install" / "setup.bash"),
+        )
+    )
+    if overlay.is_dir():
+        overlay /= "setup.bash"
     if require_overlay:
         setups.append(overlay)
     missing = [path for path in setups if not path.is_file()]

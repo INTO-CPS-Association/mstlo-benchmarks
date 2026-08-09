@@ -1,0 +1,17 @@
+[benchmark]
+robots = [1]
+seeds = [101]
+property_sets = ["confined"]
+transports = ["direct", "ros"]
+semantics = ["delayed-qualitative"]
+algorithm = "incremental"
+duration_s = 1.0
+publish_rate_hz = 10.0
+sim_hz = 30.0
+window_s = 0.2
+dwell_s = 0.1
+
+[ros]
+discovery_s = 3.0
+checker_settle_s = 3.0
+drain_s = 3.0
