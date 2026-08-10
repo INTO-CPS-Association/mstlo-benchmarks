@@ -25,17 +25,14 @@ export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export IDL_PACKAGE_FILTER="${IDL_PACKAGE_FILTER:-std_msgs;geometry_msgs;nav_msgs;id_pose_msgs;robo_sapiens_interfaces}"
 
-if (( $# == 0 )); then
-    set -- --help
+# Everything above is what this image adds: ROS on the path.  What to run is
+# then decided exactly as it is for the other two benchmarks, by the shared
+# stage layer -- `<stage> <benchmark> [config]`, with no arguments listing what
+# there is.
+if (( $# == 0 )) || [[ "${1}" == "gather" || "${1}" == "run" || "${1}" == "analyze" ]]; then
+    exec /opt/stages/entrypoint.sh "$@"
 fi
 
-# The two mstlo benchmarks are driven as `<stage> <benchmark> [config]` by the
-# other image's entrypoint.  Accept that shape here too, so the README can
-# document all three benchmarks with one verb.  Every existing form -- `quick`,
-# `report --output-dir ...`, `test` -- is untouched.
-if [[ "${1:-}" == "run" && "${2:-}" == "multi_robot" ]]; then
-    shift 2
-    set -- "${1:-quick}"
-fi
-
+# The benchmark's own tool, for the things that are not a stage: `test`, and
+# `report --output-dir` against a directory of one's choosing.
 exec /opt/venv/bin/mstlo-bench "$@"

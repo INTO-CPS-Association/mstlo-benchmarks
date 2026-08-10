@@ -1,0 +1,14 @@
+# Copied to /src/.cargo/config.toml by docker/Dockerfile, where it covers every
+# cargo build in the image.
+#
+# The multi-robot benchmark must measure the vendored mstlo/ subtree, not the
+# published crate.  The runner says so in its own Cargo.toml; the checker it
+# drives is a subtree of its own and asks crates.io for mstlo, and this redirects
+# that too -- without editing anything inside a subtree.
+#
+# Deliberately not at the repository root: a cargo config there applies to every
+# checkout below it, so building a subtree locally would silently re-lock its
+# committed Cargo.lock.  Paths are relative to this file's directory, which is
+# /src in the image.
+[patch.crates-io]
+mstlo = { path = "mstlo/mstlo" }

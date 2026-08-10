@@ -16,10 +16,13 @@ services:
       ROS_LOCALHOST_ONLY: "1"
       RMW_IMPLEMENTATION: rmw_fastrtps_cpp
       MSTLO_BENCH_PREBUILT: "1"
-      MSTLO_BENCH_RESULTS_ROOT: /results
+      RESULTS_ROOT: /results
       MPLBACKEND: Agg
       MPLCONFIGDIR: /tmp/matplotlib
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      # The container only ever sees the VM's CPU, so set this to record the
+      # real one: MSTLO_BENCH_HOST_CPU="Apple M4 Pro" docker compose run ...
+      MSTLO_BENCH_HOST_CPU: ${MSTLO_BENCH_HOST_CPU:-}
     volumes:
       - type: bind
         source: ./results

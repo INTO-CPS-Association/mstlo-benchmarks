@@ -36,10 +36,6 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY mstlo /opt/mstlo
 RUN pip install --no-cache-dir /opt/mstlo/mstlo-python
 
-# This repository's stage layer.  It lives outside the subtree so that a
-# `git subtree pull` never has to merge anything this repository wrote.
-COPY benchmarks /opt/stages
-
 # Compile both benches and both feature sets now, so `docker compose run`
 # measures instead of building.  Needing the network at run time would be a bug.
 ENV CARGO_TARGET_DIR=/opt/mstlo/target
@@ -47,6 +43,18 @@ RUN cd /opt/mstlo/mstlo \
     && cargo bench --locked --no-run --bench paper_benchmark --bench incubator_benchmark \
     && cargo bench --locked --no-run --bench paper_benchmark --bench incubator_benchmark \
          --features track-cache-size
+
+# This repository's stage layer.  It lives outside the subtree so that a
+# `git subtree pull` never has to merge anything this repository wrote, and it
+# is copied after the compile above so that editing a stage script or a config
+# does not rebuild the benches.
+#
+# Only the two benchmarks this image runs, plus the files they share.  The third
+# benchmark, benchmarks/multi_robot, needs ROS 2 and is built by docker/Dockerfile.
+COPY benchmarks/entrypoint.sh benchmarks/config.py benchmarks/metadata.py \
+    benchmarks/results.py /opt/stages/
+COPY benchmarks/synthetic_signal /opt/stages/synthetic_signal
+COPY benchmarks/incubator /opt/stages/incubator
 
 ENV RESULTS_ROOT=/results \
     MSTLO_ROOT=/opt/mstlo \

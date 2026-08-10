@@ -60,10 +60,16 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages "uv==${UV_VERS
 WORKDIR /src
 
 # Copy only files needed by Cargo and colcon before the expensive Rust build.
-# Configurations, tests, and the runtime entrypoint are copied after this layer so
-# changing a suite or shell wrapper does not invalidate the compiled artifacts.
-COPY benchmark-runner/Cargo.toml benchmark-runner/Cargo.lock /src/benchmark-runner/
-COPY benchmark-runner/src /src/benchmark-runner/src
+# The stage layer, the configs and the tests are copied into the runtime stage
+# instead, so editing a config or a shell script does not invalidate the
+# compiled artifacts.
+#
+# The runner keeps its position relative to the repository root: its Cargo.toml
+# depends on ../../../robosapiens-trustworthiness-checker, which is the subtree
+# copied below.
+COPY benchmarks/multi_robot/runner/Cargo.toml benchmarks/multi_robot/runner/Cargo.lock \
+    /src/benchmarks/multi_robot/runner/
+COPY benchmarks/multi_robot/runner/src /src/benchmarks/multi_robot/runner/src
 COPY robosapiens-trustworthiness-checker/Cargo.toml \
     robosapiens-trustworthiness-checker/Cargo.lock \
     robosapiens-trustworthiness-checker/LICENSE.md \
@@ -80,24 +86,31 @@ COPY robosapiens-trustworthiness-checker/docs/src/assets/dataflow \
 COPY robosapiens-trustworthiness-checker/ros_interfaces \
     /src/robosapiens-trustworthiness-checker/ros_interfaces
 
+# Both binaries monitor with the vendored mstlo subtree rather than the
+# published crate: the runner depends on it by path and patches its own graph,
+# and this config does the same for the checker built on its own below.
+COPY docker/cargo-config.toml /src/.cargo/config.toml
+COPY mstlo/mstlo /src/mstlo/mstlo
+
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
     && cd /src/robosapiens-trustworthiness-checker/ros_interfaces \
     && colcon build --packages-select robo_sapiens_interfaces id_pose_msgs --merge-install
 
+# The checker builds without --locked on purpose: it is a subtree, its committed
+# Cargo.lock still pins mstlo to the registry, and the patch above necessarily
+# re-locks that entry.  Everything else stays at the versions its lock records.
+# The runner's lock is this repository's own and is kept exact.
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
     && source /src/robosapiens-trustworthiness-checker/ros_interfaces/install/setup.bash \
     && cd /src/robosapiens-trustworthiness-checker \
-    && cargo build --locked --profile "${PROFILE}" --features ros --bin trustworthiness_checker \
-    && cd /src/benchmark-runner \
+    && cargo build --profile "${PROFILE}" --features ros --bin trustworthiness_checker \
+    && cd /src/benchmarks/multi_robot/runner \
     && cargo build --locked --profile "${PROFILE}" --features ros
 
 # Keep Python changes and suite edits out of the expensive Rust build cache.
 COPY pyproject.toml uv.lock ./
-COPY mstlo_bench ./mstlo_bench
+COPY benchmarks/multi_robot/mstlo_bench ./benchmarks/multi_robot/mstlo_bench
 RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --frozen --extra dev --no-editable
-
-COPY configs /src/configs
-COPY tests /src/tests
 
 FROM ros:${ROS_DISTRO}-ros-base@${ROS_BASE_DIGEST} AS runtime
 
@@ -113,9 +126,9 @@ ENV ROS_DISTRO=${ROS_DISTRO} \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     IDL_PACKAGE_FILTER=std_msgs\;geometry_msgs\;nav_msgs\;id_pose_msgs\;robo_sapiens_interfaces \
     ROS_LOG_DIR=/tmp/mstlo-bench-ros \
-    MSTLO_BENCH_ROOT=/opt/mstlo-bench \
-    MSTLO_BENCH_RESULTS_ROOT=/results \
-    MSTLO_BENCH_TESTS_DIR=/opt/mstlo-bench/tests \
+    MSTLO_BENCH_ROOT=/opt/stages/multi_robot \
+    MSTLO_BENCH_TESTS_DIR=/opt/stages \
+    RESULTS_ROOT=/results \
     MSTLO_BENCH_PREBUILT=1 \
     MSTLO_RUNNER_BIN=/usr/local/bin/mstlo-benchmark-runner \
     MSTLO_CHECKER_BIN=/usr/local/bin/trustworthiness_checker \
@@ -144,16 +157,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /opt/venv /opt/venv
 COPY --from=build /src/robosapiens-trustworthiness-checker/ros_interfaces/install /opt/ros_interfaces/install
-COPY --from=build /src/benchmark-runner/target/bench-fast/mstlo-benchmark-runner /usr/local/bin/mstlo-benchmark-runner
+COPY --from=build /src/benchmarks/multi_robot/runner/target/bench-fast/mstlo-benchmark-runner /usr/local/bin/mstlo-benchmark-runner
 COPY --from=build /src/robosapiens-trustworthiness-checker/target/bench-fast/trustworthiness_checker /usr/local/bin/trustworthiness_checker
-COPY --from=build /src/configs /opt/mstlo-bench/configs
-COPY --from=build /src/tests /opt/mstlo-bench/tests
+
+# The stage layer, byte for byte the one in the other image: the same entrypoint
+# decides the same things for all three benchmarks, and only the stage scripts
+# below it differ.
+COPY benchmarks/entrypoint.sh benchmarks/config.py benchmarks/metadata.py \
+    benchmarks/results.py /opt/stages/
+COPY benchmarks/tests /opt/stages/tests
+COPY benchmarks/multi_robot/run.sh benchmarks/multi_robot/analyze.sh \
+    /opt/stages/multi_robot/
+COPY benchmarks/multi_robot/configs /opt/stages/multi_robot/configs
+COPY benchmarks/multi_robot/tests /opt/stages/multi_robot/tests
 COPY docker/entrypoint.sh /usr/local/bin/mstlo-bench-entrypoint
 
 RUN chmod 0755 /usr/local/bin/mstlo-bench-entrypoint \
     /usr/local/bin/mstlo-benchmark-runner \
     /usr/local/bin/trustworthiness_checker \
+    /opt/stages/entrypoint.sh \
+    /opt/stages/multi_robot/run.sh \
+    /opt/stages/multi_robot/analyze.sh \
     && mkdir -p /opt/mstlo-bench /results /tmp/matplotlib /tmp/mstlo-bench-ros \
+    && chmod -R a+rX /opt/stages \
     && chown -R 1000:1000 /opt/venv /opt/mstlo-bench /results /tmp/matplotlib /tmp/mstlo-bench-ros
 
 LABEL org.opencontainers.image.title="MSTLO reference benchmark" \
@@ -164,4 +190,4 @@ LABEL org.opencontainers.image.title="MSTLO reference benchmark" \
 WORKDIR /opt/mstlo-bench
 USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/mstlo-bench-entrypoint"]
-CMD ["--help"]
+CMD []
