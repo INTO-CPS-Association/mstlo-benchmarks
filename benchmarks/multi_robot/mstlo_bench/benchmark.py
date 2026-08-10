@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from .collect import append_result
-from .metadata import collect_metadata, update_metadata, utc_now, write_metadata
 from .progress import (
     expected_progress_seconds,
     format_progress_label,
@@ -25,11 +24,17 @@ from .progress import (
 from .properties import semantic_horizon_ms, write_artefacts
 from .ros import activate
 
+# This benchmark's own tree (benchmarks/multi_robot) and the repository root.
+# The checker is a subtree shared with the rest of the repository, so it is
+# resolved against the latter; everything else lives beside this package.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = _SOURCE_ROOT.parents[1]
 ROOT = Path(os.environ.get("MSTLO_BENCH_ROOT", _SOURCE_ROOT))
-RUNNER_DIR = Path(os.environ.get("MSTLO_RUNNER_DIR", ROOT / "benchmark-runner"))
+RUNNER_DIR = Path(os.environ.get("MSTLO_RUNNER_DIR", ROOT / "runner"))
 CHECKER_DIR = Path(
-    os.environ.get("MSTLO_CHECKER_DIR", ROOT / "robosapiens-trustworthiness-checker")
+    os.environ.get(
+        "MSTLO_CHECKER_DIR", REPO_ROOT / "robosapiens-trustworthiness-checker"
+    )
 )
 PROFILE = "bench-fast"
 MAX_RETRIES = 5
@@ -112,115 +117,72 @@ def run(
         return _run_locked(config_path, output_dir, resume=resume)
 
 
-def fresh_result_directory(results_root: Path, suite_name: str) -> Path:
-    """Create and return a unique directory for a new named suite run."""
-    results_root.mkdir(parents=True, exist_ok=True)
-    timestamp = utc_now().replace("-", "").replace(":", "").replace("+00:00", "")
-    timestamp = timestamp.replace("Z", "Z")
-    safe_name = (
-        "".join(
-            character if character.isalnum() or character in "-_" else "-"
-            for character in suite_name
-        ).strip("-")
-        or "benchmark"
-    )
-    for _ in range(10):
-        candidate = results_root / f"{safe_name}-{timestamp}-{uuid.uuid4().hex[:8]}"
-        try:
-            candidate.mkdir()
-        except FileExistsError:
-            continue
-        return candidate
-    raise RuntimeError(
-        f"could not allocate a fresh result directory under {results_root}"
-    )
-
-
 def _run_locked(
     config_path: Path, output_dir: Path, *, resume: bool = False
 ) -> list[dict[str, Any]]:
     config = load_config(config_path)
     _prepare_output_directory(config_path, output_dir, resume=resume)
-    existing_metadata = output_dir / "metadata.json"
-    started_at = utc_now()
-    if resume and existing_metadata.exists():
-        try:
-            started_at = json.loads(existing_metadata.read_text(encoding="utf-8"))[
-                "started_at_utc"
-            ]
-        except (KeyError, json.JSONDecodeError):
-            raise ValueError(
-                f"{existing_metadata} is not valid benchmark metadata; start a fresh run"
-            ) from None
-    write_metadata(
-        output_dir,
-        collect_metadata(config_path, started_at_utc=started_at, status="running"),
-    )
 
     rows: list[dict[str, Any]] = []
-    try:
-        topic_namespace = f"mstlo_bench_{uuid.uuid4().hex}"
-        _build("ros" in config.transports)
-        points = [
-            Point(*values)
-            for values in itertools.product(
-                config.robots,
-                config.seeds,
-                config.property_sets,
-                config.transports,
-                config.semantics,
-            )
-        ]
-        total = len(points)
-        label_width = max(
-            len(format_progress_label(index, total, point))
-            for index, point in enumerate(points, 1)
+    topic_namespace = f"mstlo_bench_{uuid.uuid4().hex}"
+    _build("ros" in config.transports)
+    points = [
+        Point(*values)
+        for values in itertools.product(
+            config.robots,
+            config.seeds,
+            config.property_sets,
+            config.transports,
+            config.semantics,
         )
-        maximum_seconds = max(
-            expected_progress_seconds(
-                point,
-                config.duration_s,
-                config.checker_settle_s,
-                config.discovery_s,
-                config.drain_s,
-            )
-            for point in points
+    ]
+    total = len(points)
+    label_width = max(
+        len(format_progress_label(index, total, point))
+        for index, point in enumerate(points, 1)
+    )
+    maximum_seconds = max(
+        expected_progress_seconds(
+            point,
+            config.duration_s,
+            config.checker_settle_s,
+            config.discovery_s,
+            config.drain_s,
         )
-        seconds_width = len(f"{maximum_seconds:.1f}")
+        for point in points
+    )
+    seconds_width = len(f"{maximum_seconds:.1f}")
 
-        print(f"Running {total} benchmark points into {output_dir}", flush=True)
-        for index, point in enumerate(points, 1):
+    print(f"Running {total} benchmark points into {output_dir}", flush=True)
+    for index, point in enumerate(points, 1):
 
-            def attempt(point: Point = point, index: int = index) -> dict[str, Any]:
-                try:
-                    return run_with_progress(
-                        point,
-                        index,
-                        total,
-                        duration_s=config.duration_s,
-                        settle_s=config.checker_settle_s,
-                        warmup_s=config.discovery_s,
-                        drain_s=config.drain_s,
-                        label_width=label_width,
-                        seconds_width=seconds_width,
-                        runner=lambda: _run_point(
-                            point, config, output_dir, topic_namespace
-                        ),
-                    )
-                except Exception as error:
-                    return _failure_row(point, config, str(error))
+        def attempt(point: Point = point, index: int = index) -> dict[str, Any]:
+            try:
+                return run_with_progress(
+                    point,
+                    index,
+                    total,
+                    duration_s=config.duration_s,
+                    settle_s=config.checker_settle_s,
+                    warmup_s=config.discovery_s,
+                    drain_s=config.drain_s,
+                    label_width=label_width,
+                    seconds_width=seconds_width,
+                    runner=lambda: _run_point(
+                        point, config, output_dir, topic_namespace
+                    ),
+                )
+            except Exception as error:
+                return _failure_row(point, config, str(error))
 
-            row = run_attempts(attempt)
-            append_result(output_dir, row)
-            rows.append(row)
-            if row["ok"]:
-                print(f"  p95 {row['latency_overhead_ms_p95']:.3f} ms")
-            else:
-                print(f"  failed: {row['error']}")
-        return rows
-    finally:
-        status = "success" if rows and all(row.get("ok") for row in rows) else "failed"
-        update_metadata(output_dir, status=status)
+        row = run_attempts(attempt)
+        append_result(output_dir, row)
+        rows.append(row)
+        if row["ok"]:
+            print(f"  p95 {row['latency_overhead_ms_p95']:.3f} ms")
+        else:
+            print(f"  failed: {row['error']}")
+    return rows
 
 
 def run_attempts(
