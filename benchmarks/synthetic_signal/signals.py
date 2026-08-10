@@ -1,9 +1,7 @@
 """Generate a signal for the run to be measured against.
 
 Five shapes, all written as `timestep,value` CSV and all sampled at
---sampling-rate.  The default 1.0 Hz gives integer timesteps 0, 1, 2, ..., which
-is what makes a bound such as `G[0,1000]` mean the same number of steps to every
-monitor: mstlo measures its bounds in seconds, RTAMT counts samples.
+--sampling-rate.  The default 1.0 Hz gives integer timesteps 0, 1, 2, ...,
 
 sine and chirp are upstream's, unchanged -- signal_generation/signal_generator.py
 in the mstlo checkout produces the same file for the same arguments, which

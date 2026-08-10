@@ -25,9 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 
-# RTAMT is deliberately absent -- see benchmarks/requirements.txt.  Nothing in
-# this image imports it: the stage scripts never invoke rtamt_benchmark.py and
-# always pass --no-rtamt to the incubator benchmark.
 COPY benchmarks/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 

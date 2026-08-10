@@ -11,9 +11,6 @@
 #
 # Every signal type gets a directory of its own under mstlo/, so no CSV ever
 # holds two of them and the analysis never has to tell them apart.
-#
-# The mstlo paper also compares against RTAMT.  This image ships no RTAMT, so
-# rtamt_benchmark.py is never invoked here; see ../requirements.txt.
 
 set -e
 

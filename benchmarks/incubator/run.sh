@@ -9,9 +9,6 @@
 #
 # The signal comes from the newest gather, or from the recording committed in
 # the mstlo checkout when there has not been one.
-#
-# This image ships no RTAMT, so stage 2 passes --no-rtamt and nothing imports
-# it; see ../requirements.txt.
 
 set -e
 

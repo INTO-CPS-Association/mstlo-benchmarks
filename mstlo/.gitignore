@@ -5,6 +5,4 @@ __pycache__/
 target/
 cobertura.xml
 _site/
-# local RTAMT verification scratch, not part of the artefact
-benchmarks/synthetic_signal/verify-rtamt.sh
-benchmarks/synthetic_signal/rtamt-verify-out/
+
