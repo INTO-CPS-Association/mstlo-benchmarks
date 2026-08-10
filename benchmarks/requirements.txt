@@ -1,0 +1,12 @@
+# RTAMT is deliberately absent.  The version the mstlo paper compares against is
+# a source build with a compiled C++ backend and a fix that is not upstream, so
+# baking it in would make this image slow to build and awkward to trust.  These
+# benchmarks therefore measure mstlo and mstlo-python only; the recipe for the
+# comparison is in the mstlo repository, under
+# benchmarks/synthetic_signal/README.md.
+matplotlib==3.10.8
+numpy==2.4.3
+pandas==3.0.1
+scikit_learn==1.8.0
+scipy==1.17.1
+tqdm==4.67.1

@@ -1,0 +1,11 @@
+# Proves the pipeline works.  Says nothing about performance.
+
+[common]
+PHASES = "normal,lid_open"
+
+[run]
+M_RUNS = 2
+WARMUP_RUNS = 0
+MEMORY_RUNS = 3
+
+[analyze]

@@ -1,19 +1,60 @@
-# MSTLO reference benchmark
+# MSTLO benchmarks
 
-This repository compares MSTLO latency through an in-process direct input path and a ROS 2 input path. Both paths use the same Brownian robot source, properties, algorithm, semantics, and publication schedule. The reported metric is latency overhead:
+Three benchmarks for [MSTLO](https://github.com/INTO-CPS-Association/mstlo), each reproducible with a single `docker compose` command. **Docker and the Docker Compose plugin are the only host requirements** — no Rust, Python, `uv`, ROS, `colcon`, or broker installation is needed.
+
+| benchmark | what it measures | command |
+|---|---|---|
+| **multi-robot** | MSTLO latency overhead, in-process vs. ROS 2 | `docker compose run --rm benchmark run multi_robot quick` |
+| **synthetic signal** | how monitoring cost scales with the temporal depth of a formula, across four semantics | `docker compose run --rm bench run synthetic_signal` |
+| **incubator** | monitoring a recorded digital-twin temperature trace, with the monitor's memory footprint | `docker compose run --rm bench run incubator` |
+
+Two images back these: multi-robot needs ROS 2 and has its own (`docker/Dockerfile`), while the other two are pure Rust and Python (`docker/Dockerfile.mstlo`). That is why the service name differs; the verb does not.
+
+```bash
+docker compose build            # build everything, once
+```
+
+Measuring and analysing are separate stages, so figures can be redrawn without re-measuring:
+
+```bash
+docker compose run --rm bench run     synthetic_signal
+docker compose run --rm bench analyze synthetic_signal
+```
+
+Run `docker compose run --rm bench` with no arguments to list the available benchmarks, stages and configs.
+
+## Where the code comes from
+
+Nothing here is a copy-paste. Every benchmarked component is vendored as a `git subtree`, so the exact source that produced a number is in this repository's history:
+
+| subtree | upstream |
+|---|---|
+| `mstlo/` | [`INTO-CPS-Association/mstlo`](https://github.com/INTO-CPS-Association/mstlo) — the crate, the Python bindings, and the synthetic-signal and incubator benchmark scripts |
+| `robosapiens-trustworthiness-checker/` | the checker binary and crate used by the multi-robot benchmark |
+| `multi-robot-runtime-verification/` | the Brownian multi-robot simulator |
+| `incubator-dt-course/` | [`clagms/IncubatorDTCourse`](https://github.com/clagms/IncubatorDTCourse) — the incubator digital-twin course |
+| `example-digital-twin-incubator/` | the course's `incubator_dt` submodule, vendored separately because a subtree does not carry submodules |
+
+Only the thin stage layer under `benchmarks/` (shell scripts, TOML configs) and the Docker files are written by this repository. Nothing in it writes back into a subtree, so `git subtree pull` never has to merge a local edit.
+
+## About the numbers
+
+**These are not the numbers in the MSTLO paper, and they are not meant to match.** The paper's measurements were taken natively on macOS/arm64 with a source-built RTAMT; these run in a Linux container on whatever hardware you have. Absolute timings differ, and so do some ratios — the same monitor measured natively and in a container differed by ~16% in our own comparison. What reproduces here is the shape of the result, not the digits.
+
+RTAMT is deliberately **not** installed. The version the paper compares against is not on PyPI, needs a separate cmake/Boost.Python build for its C++ backend, and needs a fix that is not upstream — three failure modes that would make this repository worse at its one job. The comparison plots against RTAMT therefore do not appear here; the full recipe for reproducing them is in the [mstlo repository](https://github.com/INTO-CPS-Association/mstlo/blob/main/benchmarks/synthetic_signal/README.md#installing-rtamt).
+
+## Multi-robot
+
+Compares MSTLO latency through an in-process direct input path and a ROS 2 input path. Both paths use the same Brownian robot source, properties, algorithm, semantics, and publication schedule. The reported metric is latency overhead:
 
 ```text
 first valid verdict arrival - earliest time the semantics permits a verdict
 ```
 
-## Docker-first run
-
-The only host requirements for benchmark execution are **Docker and the Docker Compose plugin**. The image contains ROS 2 Jazzy, the vendored ROS interfaces, the Rust checker and runner, and the Python reporting environment. No Rust, Python, `uv`, ROS, or `colcon` installation is needed on the host.
-
 The shortest working command is:
 
 ```bash
-docker compose run --rm benchmark quick
+docker compose run --rm benchmark run multi_robot quick
 ```
 
 The command builds the benchmark image first when necessary, allocates a fresh result directory, runs both direct and ROS points, writes a report, and prints the result/report locations. A failed final benchmark point makes the container exit nonzero even though the partial report is still written.
@@ -115,6 +156,85 @@ HOST_UID="$(id -u)" HOST_GID="$(id -g)" \
 ```
 
 No host networking, host IPC, privileged mode, host devices, Docker socket, GPU, X11, EMQX, or desktop ROS installation is used. ROS/DDS communication stays inside the container with localhost-only discovery and a fixed Fast DDS implementation.
+
+## Synthetic signal
+
+Sweeps 51 temporal bounds for each of the until, globally and eventually families across four semantics, timing the native Rust monitor and the Python bindings on a generated chirp signal, then fits the scaling curves.
+
+```bash
+docker compose run --rm bench run     synthetic_signal
+docker compose run --rm bench analyze synthetic_signal
+```
+
+`run` generates the signal and measures; `analyze` produces the regression fits, the Mann-Whitney table and the plots, and finds its input files itself. The default configuration takes **hours**. Check the pipeline first:
+
+```bash
+docker compose run --rm bench run synthetic_signal quick
+```
+
+## Incubator
+
+Replays a recorded temperature trace from the [incubator digital-twin course](https://github.com/clagms/IncubatorDTCourse) through two STL specifications, times the monitors on it, and records the native monitor's memory footprint after every update.
+
+```bash
+docker compose run --rm bench run     incubator
+docker compose run --rm bench analyze incubator
+```
+
+This works out of the box because the recording used in the paper is committed in the `mstlo/` subtree; `run` copies it in when no fresher one exists.
+
+### Recording a fresh session
+
+The `gather` stage drives the course's real emulator and controller over RabbitMQ and records a new session. The broker is a compose service, the course and its submodule are subtrees, and the two notebook-generated service scripts are committed under `benchmarks/incubator/course-services/` — so there is nothing to clone, extract or step through:
+
+```bash
+docker compose run --rm gather gather incubator
+```
+
+**This takes about 70 minutes.** The emulator runs in real time at one sample every 3 s, and the box starts at 30 °C, so roughly the first 15 minutes are spent pre-heating into the control band before any useful sample appears. A shorter session that still exercises every phase — pre-heat, warm-up, normal, lid-open — takes about 20 minutes:
+
+```bash
+docker compose run --rm gather gather incubator smoke
+```
+
+Afterwards `run` picks up the new recording instead of the committed one, and says which it used.
+
+## Configs
+
+Every knob lives in `benchmarks/<benchmark>/configs/*.toml`, one section per stage plus a shared `[common]`. Pass the name as the third argument; the default is `default`:
+
+```bash
+docker compose run --rm bench run incubator quick
+```
+
+`default` reproduces the measurements the paper reports. `quick` proves the pipeline works and says nothing about performance. Anything set in the environment wins over the file:
+
+```bash
+docker compose run --rm -e M_RUNS=7 bench run incubator quick
+```
+
+## Results
+
+Everything is written under `results/`, bind-mounted from the host. The two kinds of benchmark use it differently, on purpose:
+
+```text
+results/
+├── quick-20260809T120000Z-a1b2c3d4/   multi-robot: one fresh directory per run
+├── synthetic_signal/                  stage benchmarks: a stable path
+└── incubator/
+```
+
+A multi-robot run is one self-contained sweep, so each gets its own timestamped directory and `report` is pointed at a specific one. The other two are a *pipeline* — `gather` writes the recording, `run` reads it and writes the measurements, `analyze` reads those and writes the figures — so they need a stable location to hand work between stages. To keep a particular run, name it:
+
+```bash
+docker compose run --rm -e RESULTS_DIR=/results/incubator-2026-08-10-A bench run incubator
+```
+
+Each `run` and `gather` drops a `metadata.json` next to its output, recording the config and its SHA-256, the effective settings, the toolchain, architecture, CPU and start/finish times. Inside a VM the container only sees the guest's CPU, so pass the real one if it matters:
+
+```bash
+MSTLO_BENCH_HOST_CPU="Apple M4 Pro" docker compose run --rm bench run synthetic_signal
+```
 
 ## Local development
 

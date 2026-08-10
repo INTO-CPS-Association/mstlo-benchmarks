@@ -1,0 +1,127 @@
+# The two benchmarks that come from the mstlo repository, which this repository
+# vendors as the mstlo/ subtree.  The multi-robot benchmark has its own image
+# (docker/Dockerfile) because it needs ROS 2 and this one does not.
+#
+#   docker compose run --rm bench   run     synthetic_signal
+#   docker compose run --rm bench   analyze incubator
+#   docker compose run --rm gather  gather  incubator
+#
+# Two targets: `bench` runs and analyses; `gather` adds the course services and
+# their dependencies so a fresh incubator session can be recorded.
+
+ARG RUST_VERSION=1.95.0
+ARG IMAGE_VERSION=dev
+ARG REPOSITORY_REVISION=unknown
+
+FROM rust:${RUST_VERSION}-bookworm AS bench
+ARG IMAGE_VERSION
+ARG REPOSITORY_REVISION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-dev util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Debian is PEP-668 externally managed, so everything lives in a venv.
+RUN python3 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+# RTAMT is deliberately absent -- see benchmarks/requirements.txt.  Nothing in
+# this image imports it: the stage scripts never invoke rtamt_benchmark.py and
+# always pass --no-rtamt to the incubator benchmark.
+COPY benchmarks/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# The vendored mstlo checkout, whole: the crate, the bindings and the Python
+# benchmark scripts all reference each other by relative path.
+COPY mstlo /opt/mstlo
+RUN pip install --no-cache-dir /opt/mstlo/mstlo-python
+
+# This repository's stage layer.  It lives outside the subtree so that a
+# `git subtree pull` never has to merge anything this repository wrote.
+COPY benchmarks /opt/stages
+
+# Compile both benches and both feature sets now, so `docker compose run`
+# measures instead of building.  Needing the network at run time would be a bug.
+ENV CARGO_TARGET_DIR=/opt/mstlo/target
+RUN cd /opt/mstlo/mstlo \
+    && cargo bench --locked --no-run --bench paper_benchmark --bench incubator_benchmark \
+    && cargo bench --locked --no-run --bench paper_benchmark --bench incubator_benchmark \
+         --features track-cache-size
+
+ENV RESULTS_ROOT=/results \
+    MSTLO_ROOT=/opt/mstlo \
+    CARGO_NET_OFFLINE=true \
+    HOME=/tmp \
+    MPLBACKEND=Agg \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    MSTLO_BENCH_IMAGE_VERSION=${IMAGE_VERSION} \
+    MSTLO_BENCH_REPOSITORY_REVISION=${REPOSITORY_REVISION}
+
+# The container runs as the invoking user, so everything written at run time has
+# to be writable by an arbitrary uid: the cargo target directory, the cargo
+# package-cache lock (taken even when offline), the results mount, and
+# matplotlib's config directory.
+RUN mkdir -p /results /tmp/matplotlib \
+    && chmod -R a+rX  /opt/mstlo /opt/stages /opt/venv \
+    && chmod -R a+rwX /opt/mstlo/target /usr/local/cargo /results /tmp/matplotlib
+
+WORKDIR /opt/mstlo
+ENTRYPOINT ["/opt/stages/entrypoint.sh"]
+CMD []
+
+
+# ---------------------------------------------------------------------------
+FROM bench AS gather
+
+# run_experiment.py lives in the mstlo subtree and must stay byte-exact so that
+# subtree pulls stay conflict-free.  It resolves the course checkout as
+#
+#     REPO_ROOT = dirname(dirname(abspath(__file__)))  ->  /opt/mstlo/benchmarks
+#
+# and then requires REPO_ROOT/incubator_dt/software (importable) plus
+# REPO_ROOT/5-IncubatorPTEmulator and REPO_ROOT/2-Controller-Modelling, which it
+# launches as subprocesses from their own directories.  Both services in turn
+# assert that their own basename is what they expect and that ../incubator_dt
+# exists.  There is no environment override for any of it, so rather than patch
+# the code, this image puts the course exactly where the code already looks.
+COPY incubator-dt-course /opt/course
+
+# The course pins Example_Digital-Twin_Incubator as its `incubator_dt` git
+# submodule.  A subtree of the course alone does not bring a submodule, so it is
+# vendored separately and slotted in at the path the course expects.
+COPY example-digital-twin-incubator /opt/course/incubator_dt
+
+# pt_emulator_service.py and controller.py are %%writefile cells in the course
+# notebooks rather than committed files, so they are not in the subtree at all.
+# They are committed to this repository instead -- see
+# benchmarks/incubator/course-services/README.md.
+COPY benchmarks/incubator/course-services/ /opt/course/
+
+# Symlinks rather than copies: /opt/mstlo/benchmarks already holds README.md and
+# the two benchmark directories, and the course has top-level files of its own
+# that would collide.  Existing entries always win.  getcwd() resolves symlinks,
+# so a service started at /opt/mstlo/benchmarks/5-IncubatorPTEmulator sees
+# itself at /opt/course/5-IncubatorPTEmulator and finds ../incubator_dt there.
+RUN set -eu; \
+    for entry in /opt/course/*; do \
+        link="/opt/mstlo/benchmarks/$(basename "$entry")"; \
+        [ -e "$link" ] || ln -s "$entry" "$link"; \
+    done
+
+# The course pins its own dependency versions, some older than the ones the
+# analysis needs, so they get their own interpreter.  mstlo-python goes in too:
+# run_experiment.py imports stl_monitors.py, which needs it.
+RUN python3 -m venv /opt/course-venv \
+    && /opt/course-venv/bin/pip install --no-cache-dir \
+         -r /opt/course/requirements.txt \
+         -r /opt/course/incubator_dt/software/requirements.txt \
+         pyhocon \
+    && /opt/course-venv/bin/pip install --no-cache-dir /opt/mstlo/mstlo-python
+
+ENV COURSE_ROOT=/opt/course \
+    RABBITMQ_HOST=rabbitmq \
+    GATHER_PYTHON=/opt/course-venv/bin/python
+
+# gather.sh rewrites the broker host in startup.conf, and the services write
+# logs next to themselves.
+RUN chmod -R a+rwX /opt/course /opt/course-venv

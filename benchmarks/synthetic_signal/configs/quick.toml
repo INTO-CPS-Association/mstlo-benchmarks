@@ -1,0 +1,8 @@
+# Proves the pipeline works.  Says nothing about performance.
+
+[run]
+SIGNAL_SIZE = 2000
+M_RUNS = 2
+WARMUP_RUNS = 0
+
+[analyze]

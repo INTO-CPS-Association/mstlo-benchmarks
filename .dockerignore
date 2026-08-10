@@ -75,3 +75,20 @@ robosapiens-trustworthiness-checker/integrations/fmu
 README.md
 LICENSE.md
 ICA-USAGE-MODE.txt
+
+# The mstlo subtree feeds docker/Dockerfile.mstlo, so most of it has to stay in
+# the context.  Two things do not:
+#
+#   paper_results/ is ~36 MB of figures and CSVs published with the RV26 paper.
+#   Nothing in this image reads it, and the numbers it contains were measured
+#   natively on macOS -- they are not what this image reproduces.
+mstlo/benchmarks/synthetic_signal/paper_results
+mstlo/_site
+mstlo/cobertura.xml
+
+# But the incubator's committed recording MUST stay: it is the signal that
+# `run incubator` replays when no fresh gather has happened, which is what makes
+# that benchmark work out of the box.  Spelled out because the broad **/results
+# and **/report rules above are easy to extend into it by accident.
+!mstlo/benchmarks/incubator/data
+!mstlo/benchmarks/incubator/data/**

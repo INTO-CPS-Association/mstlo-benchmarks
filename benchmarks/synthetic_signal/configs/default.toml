@@ -1,0 +1,9 @@
+# Reproduces the measurements the mstlo paper reports, minus the RTAMT columns
+# this image cannot produce.  The full sweep takes hours.
+
+[run]
+SIGNAL_SIZE = 20000
+M_RUNS = 50
+WARMUP_RUNS = 10
+
+[analyze]

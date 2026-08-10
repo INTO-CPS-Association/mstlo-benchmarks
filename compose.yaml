@@ -24,3 +24,68 @@ services:
       - type: bind
         source: ./results
         target: /results
+
+  # The two benchmarks vendored from the mstlo repository.  No ROS, so they get
+  # their own, much smaller image.
+  bench:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mstlo
+      target: bench
+      args:
+        RUST_VERSION: 1.95.0
+        IMAGE_VERSION: ${MSTLO_BENCH_IMAGE_VERSION:-dev}
+        REPOSITORY_REVISION: ${MSTLO_BENCH_REPOSITORY_REVISION:-unknown}
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /opt/mstlo
+    environment:
+      RESULTS_ROOT: /results
+      CARGO_NET_OFFLINE: "true"
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+      # The container only ever sees the VM's CPU, so set this to record the
+      # real one: MSTLO_BENCH_HOST_CPU="Apple M4 Pro" docker compose run ...
+      MSTLO_BENCH_HOST_CPU: ${MSTLO_BENCH_HOST_CPU:-}
+    volumes:
+      - type: bind
+        source: ./results
+        target: /results
+
+  # Only for re-recording the incubator session; needs the broker.
+  gather:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mstlo
+      target: gather
+      args:
+        RUST_VERSION: 1.95.0
+        IMAGE_VERSION: ${MSTLO_BENCH_IMAGE_VERSION:-dev}
+        REPOSITORY_REVISION: ${MSTLO_BENCH_REPOSITORY_REVISION:-unknown}
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /opt/mstlo
+    environment:
+      RESULTS_ROOT: /results
+      RABBITMQ_HOST: rabbitmq
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+      MSTLO_BENCH_HOST_CPU: ${MSTLO_BENCH_HOST_CPU:-}
+    volumes:
+      - type: bind
+        source: ./results
+        target: /results
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-incubator}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-incubator}"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

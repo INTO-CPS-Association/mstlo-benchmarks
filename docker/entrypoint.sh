@@ -29,4 +29,13 @@ if (( $# == 0 )); then
     set -- --help
 fi
 
+# The two mstlo benchmarks are driven as `<stage> <benchmark> [config]` by the
+# other image's entrypoint.  Accept that shape here too, so the README can
+# document all three benchmarks with one verb.  Every existing form -- `quick`,
+# `report --output-dir ...`, `test` -- is untouched.
+if [[ "${1:-}" == "run" && "${2:-}" == "multi_robot" ]]; then
+    shift 2
+    set -- "${1:-quick}"
+fi
+
 exec /opt/venv/bin/mstlo-bench "$@"
