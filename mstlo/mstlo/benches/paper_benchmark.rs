@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 const DEFAULT_M_RUNS: usize = 50;
 const DEFAULT_WARMUP_RUNS: usize = 1;
+/// Longest interval RoSI is asked to monitor; beyond it a run takes far longer
+/// than the other three semantics.  `ROSI_MAX_BOUND` overrides it, and `none`
+/// lifts the cap entirely.
+const DEFAULT_ROSI_MAX_BOUND: usize = 1000;
 const DEFAULT_SIGNAL_PATH: &str = "benches/signal_generation/signals/signal_20000.csv";
 const DEFAULT_OUTPUT_CSV: &str = "benches/results/paper_native_benchmark_results_N=20000.csv";
 const DEFAULT_OUTPUT_RAW_CSV: &str =
@@ -87,6 +91,24 @@ fn env_string_or_default(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+fn parse_rosi_max_bound_from_env() -> io::Result<usize> {
+    let Ok(raw) = std::env::var("ROSI_MAX_BOUND") else {
+        return Ok(DEFAULT_ROSI_MAX_BOUND);
+    };
+
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+        return Ok(usize::MAX);
+    }
+
+    raw.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid ROSI_MAX_BOUND '{raw}'. Expected a non-negative integer or 'none'."),
+        )
+    })
+}
+
 fn parse_formula_ids_from_env() -> io::Result<Option<HashSet<usize>>> {
     let Ok(raw) = std::env::var("FORMULA_IDS") else {
         return Ok(None);
@@ -124,6 +146,68 @@ fn parse_formula_ids_from_env() -> io::Result<Option<HashSet<usize>>> {
     Ok(Some(ids))
 }
 
+/// Reads the formulas to measure from a file instead of building them in.
+///
+/// A spec contains commas -- `G[0,1000] (x > 0.0)` -- so the file is
+/// tab-separated: a header line `formula_id\tspec`, then one formula per line.
+/// IDs are family labels, exactly as in [`build_formulas_map`]: every row of
+/// the globally family carries ID 6, and the analysis groups by that.
+fn read_formulas_from_tsv<P>(filename: P) -> io::Result<Vec<(usize, String)>>
+where
+    P: AsRef<Path>,
+{
+    let file = File::open(filename)?;
+    let reader = io::BufReader::new(file);
+    let mut formulas = Vec::new();
+
+    for (number, line) in reader.lines().enumerate() {
+        let line = line?;
+        let line = line.trim_end();
+
+        if number == 0 {
+            if line != "formula_id\tspec" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FORMULAS_TSV must start with a 'formula_id\\tspec' header line",
+                ));
+            }
+            continue;
+        }
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let Some((formula_id, spec)) = line.split_once('\t') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("FORMULAS_TSV line {} has no tab: '{line}'", number + 1),
+            ));
+        };
+
+        let formula_id = formula_id.trim().parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "FORMULAS_TSV line {} does not start with a formula ID: '{formula_id}'",
+                    number + 1
+                ),
+            )
+        })?;
+
+        formulas.push((formula_id, spec.trim().to_string()));
+    }
+
+    if formulas.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FORMULAS_TSV holds no formulas",
+        ));
+    }
+
+    Ok(formulas)
+}
+
 fn read_signal_from_csv<P>(filename: P) -> io::Result<Vec<Step<f64>>>
 where
     P: AsRef<Path>,
@@ -155,8 +239,9 @@ fn bench_item(
     m_runs: usize,
     warmup_runs: usize,
     semantics: SemanticsKind,
+    rosi_max_bound: usize,
 ) -> Option<(BenchResult, Vec<f64>)> {
-    if semantics == SemanticsKind::Rosi && item.interval_len > 1000 {
+    if semantics == SemanticsKind::Rosi && item.interval_len > rosi_max_bound {
         // Skip very long intervals for Rosi semantics to avoid excessive runtime
         return None;
     }
@@ -680,15 +765,19 @@ fn main() -> io::Result<()> {
         "OUTPUT_RAW_CSV",
         DEFAULT_OUTPUT_RAW_CSV,
     ));
-    let selected_formula_ids = parse_formula_ids_from_env()?;
+    let rosi_max_bound = parse_rosi_max_bound_from_env()?;
 
-    let formulas = build_formulas_map();
-    let formulas: Vec<(usize, String)> = match selected_formula_ids {
-        Some(ids) => formulas
-            .into_iter()
-            .filter(|(formula_id, _)| ids.contains(formula_id))
-            .collect(),
-        None => formulas,
+    // FORMULAS_TSV is already the selection -- whoever wrote the file decided
+    // what belongs in it -- so FORMULA_IDS only filters the built-in catalog.
+    let formulas = match std::env::var("FORMULAS_TSV") {
+        Ok(path) => read_formulas_from_tsv(&path)?,
+        Err(_) => match parse_formula_ids_from_env()? {
+            Some(ids) => build_formulas_map()
+                .into_iter()
+                .filter(|(formula_id, _)| ids.contains(formula_id))
+                .collect(),
+            None => build_formulas_map(),
+        },
     };
 
     if formulas.is_empty() {
@@ -707,8 +796,15 @@ fn main() -> io::Result<()> {
         signal_path
     );
     println!("Total formulas: {}", formulas.len());
-    if std::env::var("FORMULA_IDS").is_ok() {
-        println!("Using formula filter from FORMULA_IDS");
+    match std::env::var("FORMULAS_TSV") {
+        Ok(path) => println!("Formulas read from {path}"),
+        Err(_) if std::env::var("FORMULA_IDS").is_ok() => {
+            println!("Using formula filter from FORMULA_IDS")
+        }
+        Err(_) => {}
+    }
+    if rosi_max_bound != usize::MAX {
+        println!("Skipping Rosi above interval {rosi_max_bound}");
     }
     println!(
         "Averaging over M = {} runs (+ {} warmup)",
@@ -736,7 +832,14 @@ fn main() -> io::Result<()> {
         println!("\n--- Semantics: {} ---", sem.name());
         for item in &items {
             println!("formula_id={} spec={}", item.formula_id, item.spec);
-            let result = bench_item(item, signal.clone(), m_runs, warmup_runs, sem);
+            let result = bench_item(
+                item,
+                signal.clone(),
+                m_runs,
+                warmup_runs,
+                sem,
+                rosi_max_bound,
+            );
             if let Some((result, run_times)) = result {
                 write_result_row(&mut writer, &result)?;
                 for (run_id, &t) in run_times.iter().enumerate() {

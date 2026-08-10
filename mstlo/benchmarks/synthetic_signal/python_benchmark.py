@@ -151,10 +151,39 @@ def bench_formula(
     }
 
 
-def should_process_formula(spec: str, semantics: str) -> bool:
+def load_formulas(path: str) -> list[tuple[int, str]]:
+    """Read the formulas to measure from a file instead of using FORMULAS.
+
+    A spec contains commas -- ``G[0,1000] (x > 0.0)`` -- so the file is
+    tab-separated: a header line ``formula_id<TAB>spec``, then one formula per
+    line.  IDs stay family labels, exactly as in FORMULAS above.
+    """
+    with open(path) as f:
+        lines = f.read().splitlines()
+
+    if not lines or lines[0].split("\t") != ["formula_id", "spec"]:
+        raise SystemExit(f"{path} must start with a 'formula_id\\tspec' header line")
+
+    formulas: list[tuple[int, str]] = []
+    for number, line in enumerate(lines[1:], start=2):
+        if not line.strip():
+            continue
+        if "\t" not in line:
+            raise SystemExit(f"{path} line {number} has no tab: {line!r}")
+        formula_id, spec = line.split("\t", 1)
+        formulas.append((int(formula_id), spec.strip()))
+
+    if not formulas:
+        raise SystemExit(f"{path} holds no formulas")
+    return formulas
+
+
+def should_process_formula(spec: str, semantics: str, rosi_max_bound: float = 1000) -> bool:
     """Check if formula should be processed for given semantics.
 
-    For RoSI semantics, only process formulas with temporal bounds <= 1000.
+    For RoSI semantics, only process formulas whose temporal bound is within
+    *rosi_max_bound*; beyond it a run takes far longer than the other three
+    semantics.  ``math.inf`` lifts the cap.
     """
     if semantics != "Rosi":
         return True
@@ -165,7 +194,7 @@ def should_process_formula(spec: str, semantics: str) -> bool:
     match = re.search(r"\[0,(\d+(?:\.\d+)?)\]", spec)
     if match:
         bound = float(match.group(1))
-        return bound <= 1000
+        return bound <= rosi_max_bound
 
     # If no temporal operator with bound, include the formula
     return True
@@ -194,6 +223,16 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Untimed warmup runs before measurement",
     )
+    parser.add_argument(
+        "--formulas-tsv",
+        default=None,
+        help="Formulas to measure, as 'formula_id<TAB>spec' lines; default is the built-in catalog",
+    )
+    parser.add_argument(
+        "--rosi-max-bound",
+        default="1000",
+        help="Longest temporal bound RoSI is asked to monitor; 'none' lifts the cap",
+    )
     return parser.parse_args()
 
 
@@ -203,8 +242,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    formulas = FORMULAS if args.formulas_tsv is None else load_formulas(args.formulas_tsv)
+    rosi_max_bound = (
+        math.inf
+        if args.rosi_max_bound.strip().lower() in ("", "none")
+        else float(args.rosi_max_bound)
+    )
+
     signal = load_signal(args.signal_csv)
     print(f"Loaded signal with {len(signal)} samples from {args.signal_csv}")
+    if args.formulas_tsv is not None:
+        print(f"Formulas read from {args.formulas_tsv}")
+    print(f"Total formulas: {len(formulas)}")
     print(f"Averaging over M = {args.m_runs} runs (+ {args.warmup_runs} warmup)\n")
 
     semantics = [
@@ -263,9 +312,9 @@ def main() -> None:
 
     for sem in semantics:
         print(f"\n--- Semantics: {sem} ---")
-        pbar = tqdm(FORMULAS, desc=f"Processing {sem}")
+        pbar = tqdm(formulas, desc=f"Processing {sem}")
         for fid, spec in pbar:
-            if not should_process_formula(spec, sem):
+            if not should_process_formula(spec, sem, rosi_max_bound):
                 continue
             pbar.set_postfix({"fid": fid, "spec": spec[:30] + "..."})
             res = bench_formula(
