@@ -7,8 +7,8 @@
 #   3. time the native Rust monitor, record its memory footprint, and take a
 #      separate single pass for the cache sizes
 #
-# The signal comes from a previous gather in $RESULTS_DIR, or from the recording
-# committed in the mstlo checkout.
+# The signal comes from the newest gather, or from the recording committed in
+# the mstlo checkout when there has not been one.
 #
 # This image ships no RTAMT, so stage 2 passes --no-rtamt and nothing imports
 # it; see ../requirements.txt.
@@ -29,9 +29,20 @@ PHASES="${PHASES-normal,lid_open}"
 
 SIGNAL="$RESULTS_DIR/signal.csv"
 
+# The recording comes from the newest gather, and the committed one only when
+# there has been no gather.  Either way it is copied in and noted in the
+# metadata, so the measurements and the samples they came from stay together.
 if [ ! -f "$SIGNAL" ]; then
-	cp "$SRC/data/signal.csv" "$SIGNAL"
-	echo "using the committed recording"
+	RECORDING=$(python3 "$BENCH_ROOT/results.py" latest incubator --stage gather 2>/dev/null || true)
+	if [ -n "$RECORDING" ] && [ -f "$RECORDING/signal.csv" ]; then
+		RECORDING="$RECORDING/signal.csv"
+		echo "using the recording from $(dirname "$RECORDING")"
+	else
+		RECORDING="$SRC/data/signal.csv"
+		echo "using the committed recording"
+	fi
+	cp "$RECORDING" "$SIGNAL"
+	python3 "$BENCH_ROOT/metadata.py" input recording "$RECORDING"
 else
 	echo "using the recording already in $RESULTS_DIR"
 fi
