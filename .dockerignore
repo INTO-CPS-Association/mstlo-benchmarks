@@ -92,3 +92,18 @@ mstlo/cobertura.xml
 # and **/report rules above are easy to extend into it by accident.
 !mstlo/benchmarks/incubator/data
 !mstlo/benchmarks/incubator/data/**
+
+# The incubator course and the digital twin it vendors are ~180 MB, almost all
+# of it recorded experiment data and documentation that the gather stage never
+# touches.  It needs the `incubator` Python package, startup.conf, and the two
+# requirements files; nothing here is imported outside the upstream test suite.
+example-digital-twin-incubator/notes
+example-digital-twin-incubator/figures
+example-digital-twin-incubator/software/docs
+example-digital-twin-incubator/software/incubator/datasets
+example-digital-twin-incubator/software/incubator/tests
+example-digital-twin-incubator/software/integration_tests
+
+# The course keeps its submodule pointer at this path; the real content is
+# vendored as example-digital-twin-incubator and copied in by the Dockerfile.
+incubator-dt-course/incubator_dt
