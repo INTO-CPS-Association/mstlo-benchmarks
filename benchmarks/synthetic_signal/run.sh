@@ -18,6 +18,7 @@ SIGNAL_SIZE="${SIGNAL_SIZE:-20000}"
 
 SIGNAL="$RESULTS_DIR/signal_${SIGNAL_SIZE}_chirp.csv"
 CACHE_SIZE_RESULTS="$RESULTS_DIR/mstlo/cache_size_results_M=1.csv"
+CACHE_SIZE_RESULTS_RAW="$RESULTS_DIR/mstlo/cache_size_results_M=1_raw.csv"
 NATIVE_RESULTS="$RESULTS_DIR/mstlo/performance_results_M=${M_RUNS}.csv"
 NATIVE_RESULTS_RAW="$RESULTS_DIR/mstlo/performance_results_M=${M_RUNS}_raw.csv"
 PY_RESULTS="$RESULTS_DIR/mstlo/python_performance_results_M=${M_RUNS}.csv"
@@ -50,9 +51,14 @@ echo "=== 3/3  native Rust, cache sizes then timings (M = $M_RUNS) ==="
 	# The cache counter is read inside the timed loop, so these timings are not
 	# the ones below and go to their own file.  One pass is enough: the step
 	# counts are deterministic.
+	#
+	# OUTPUT_RAW_CSV is set even though nothing reads the raw cache-size file:
+	# unset, the bench falls back to a default path inside the mstlo checkout,
+	# which is deliberately not writable here.
 	WARMUP_RUNS=0 M_RUNS=1 FORMULA_IDS="1,2,3,4" \
 		SIGNAL_PATH="$SIGNAL" \
 		OUTPUT_CSV="$CACHE_SIZE_RESULTS" \
+		OUTPUT_RAW_CSV="$CACHE_SIZE_RESULTS_RAW" \
 		cargo bench --offline --bench paper_benchmark --features track-cache-size
 
 	WARMUP_RUNS="$WARMUP_RUNS" M_RUNS="$M_RUNS" \

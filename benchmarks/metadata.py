@@ -36,24 +36,43 @@ def cpu_model():
     Docker Desktop on macOS, say -- even that only reaches the guest's view, so
     an explicit override wins over everything.
     """
-    override = os.environ.get("MSTLO_BENCH_HOST_CPU")
+    def clean(value):
+        # lscpu prints a bare "-" for fields the guest cannot see, which is
+        # worse than nothing: it looks like an answer.
+        value = (value or "").strip()
+        return value if value and value != "-" else None
+
+    override = clean(os.environ.get("MSTLO_BENCH_HOST_CPU"))
     if override:
         return override
 
-    out = cmd("lscpu")
-    if out:
-        for line in out.splitlines():
-            if line.startswith("Model name:"):
-                return line.split(":", 1)[1].strip()
+    out = cmd("lscpu") or ""
+    for line in out.splitlines():
+        if line.startswith("Model name:"):
+            if found := clean(line.split(":", 1)[1]):
+                return found
 
+    fields = {}
     try:
         for line in open("/proc/cpuinfo"):
-            if line.startswith(("model name", "Model", "CPU part", "CPU implementer")):
-                return line.split(":", 1)[1].strip()
+            if ":" in line:
+                key, _, value = line.partition(":")
+                fields.setdefault(key.strip(), value.strip())
     except OSError:
         pass
 
-    return platform.processor() or None
+    for key in ("model name", "Model", "cpu model"):
+        if found := clean(fields.get(key)):
+            return found
+
+    # aarch64 exposes only the ARM identification registers.  Not a model name,
+    # but it does distinguish one core design from another.
+    part = clean(fields.get("CPU part"))
+    if part:
+        implementer = clean(fields.get("CPU implementer")) or "?"
+        return f"aarch64 implementer={implementer} part={part}"
+
+    return clean(platform.processor())
 
 
 def path():
