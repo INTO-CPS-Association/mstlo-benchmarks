@@ -3,7 +3,8 @@
 The stage scripts are driven by environment variables, so a config is just a
 set of them: ``[common]`` merged with the section named after the stage.  A
 variable already in the environment is left alone, which is what makes
-``docker run -e M_RUNS=7`` override the file.
+``docker run -e M_RUNS=7`` override the file.  A list becomes one entry per
+line, so a setting can hold text that no separator would survive.
 
     eval "$(python3 config.py configs/default.toml run)"
     python3 config.py configs/default.toml run --show   # effective values
@@ -18,6 +19,11 @@ import tomllib
 def fmt(value):
     if isinstance(value, bool):
         return "1" if value else ""
+    if isinstance(value, list):
+        # One entry per line.  A list is what a config reaches for when no
+        # separator can be picked -- an STL formula contains commas, brackets
+        # and spaces -- and a newline is the one thing an entry does not hold.
+        return "\n".join(fmt(item) for item in value)
     return str(value)
 
 
