@@ -15,6 +15,6 @@ LID_DURATION = 1200
 M_RUNS = 50
 WARMUP_RUNS = 1
 # Median over this many untimed passes; total_size() is not reproducible in one.
-MEMORY_RUNS = 21
+MEMORY_RUNS = 50
 
 [analyze]
