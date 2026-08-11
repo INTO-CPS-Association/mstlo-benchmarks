@@ -1,0 +1,16 @@
+name: Publish mstlo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-mstlo:
+    name: Publish mstlo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --manifest-path mstlo/Cargo.toml --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"

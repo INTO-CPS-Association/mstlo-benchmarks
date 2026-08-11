@@ -1,0 +1,58 @@
+# Reproduces the measurements the mstlo paper reports, minus the RTAMT columns
+# this image cannot produce.  The full sweep takes hours.
+#
+# Everything here is a default rather than a requirement: the settings the paper
+# fixed are spelled out so that a variation is a one-line edit.  See the README
+# for what each one does.
+
+[run]
+# The signal.  SIGNAL_TYPES may name several -- "chirp,sine,constant" -- and
+# each is generated and measured in turn.
+SIGNAL_SIZE = 20000
+SIGNAL_TYPES = "chirp"
+SAMPLING_RATE = 1.0
+
+# Shape, per type.  A signal uses the ones that mean something for it: sine
+# takes FREQUENCY, chirp sweeps START_FREQUENCY to END_FREQUENCY, the two ramps
+# run between -AMPLITUDE and +AMPLITUDE, and constant holds CONSTANT_VALUE.
+FREQUENCY = 0.01
+START_FREQUENCY = 0.01
+END_FREQUENCY = 0.0001
+AMPLITUDE = 1.0
+CONSTANT_VALUE = 0.25
+
+# The bounds the until, globally and eventually families are swept over: 1, 100,
+# 200, ... 5000, which is 51 points each.  FIRST_BOUND is what the zero bound
+# becomes, since G[0,0] has no temporal depth to measure.
+BOUND_LOW = 0
+BOUND_HIGH = 5000
+BOUND_STEP = 100
+FIRST_BOUND = 1
+
+# Which of the built-in formulas to measure: 1-4 are the paper's fixed ones,
+# 5, 6 and 7 the until, globally and eventually families.  Empty is all of them.
+FORMULA_IDS = ""
+
+# Extra formulas, measured alongside the built-ins and numbered from 100.  They
+# land in the result CSVs, but the figures only cover IDs 5, 6 and 7.
+CUSTOM_FORMULAS = []
+
+# RoSI on a long interval costs far more than the other three semantics, so it
+# is not asked for one: it contributes 11 points per family instead of 51.
+# "none" lifts the cap.
+ROSI_MAX_BOUND = 1000
+
+# The timings.
+M_RUNS = 50
+WARMUP_RUNS = 10
+
+# The separate single pass that records cached steps.  The families would tell
+# it nothing the fixed formulas do not, so it skips them; empty gives it the
+# same catalog as the timings.
+CACHE_SIZE_FORMULA_IDS = "1,2,3,4"
+
+[analyze]
+# Which formulas native and mstlo-python are compared on.  The four fixed ones
+# are single rows, so one test each says something; a family would mix every
+# bound into one distribution.  Empty tests everything measured.
+MWU_FORMULA_IDS = "1,2,3,4"

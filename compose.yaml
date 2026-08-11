@@ -1,5 +1,14 @@
+# One service per benchmark.  The service is the benchmark, so a command only has to name the stage and, when the default is not wanted, the config:
+#
+#   docker compose run --rm multi_robot      run     quick
+#   docker compose run --rm synthetic_signal analyze
+#   docker compose run --rm incubator        gather
+#
+# Two Dockerfiles back the three: multi-robot needs ROS 2 and has its own, while the other two are pure Rust and Python and are two targets over one shared base (docker/Dockerfile.mstlo).
+
 services:
-  benchmark:
+  # MSTLO latency overhead, in-process vs. ROS 2.
+  multi_robot:
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -16,11 +25,102 @@ services:
       ROS_LOCALHOST_ONLY: "1"
       RMW_IMPLEMENTATION: rmw_fastrtps_cpp
       MSTLO_BENCH_PREBUILT: "1"
-      MSTLO_BENCH_RESULTS_ROOT: /results
+      RESULTS_ROOT: /results
       MPLBACKEND: Agg
       MPLCONFIGDIR: /tmp/matplotlib
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      # The container only ever sees the VM's CPU, so set this to record the
+      # real one: MSTLO_BENCH_HOST_CPU="Apple M4 Pro" docker compose run ...
+      MSTLO_BENCH_HOST_CPU: ${MSTLO_BENCH_HOST_CPU:-}
     volumes:
       - type: bind
         source: ./results
         target: /results
+      # The configs are the knobs, and they are read from the working tree
+      # rather than from the copy the image was built with, so editing one takes
+      # effect on the next stage instead of on the next `docker compose build`.
+      # Everything else in the stage layer is code and still comes from the
+      # image.
+      - type: bind
+        source: ./benchmarks/multi_robot/configs
+        target: /opt/stages/multi_robot/configs
+        read_only: true
+
+  # How monitoring cost scales with the temporal depth of a formula.
+  synthetic_signal:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mstlo
+      target: synthetic_signal
+      args:
+        RUST_VERSION: 1.95.0
+        IMAGE_VERSION: ${MSTLO_BENCH_IMAGE_VERSION:-dev}
+        REPOSITORY_REVISION: ${MSTLO_BENCH_REPOSITORY_REVISION:-unknown}
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /opt/mstlo
+    environment:
+      RESULTS_ROOT: /results
+      CARGO_NET_OFFLINE: "true"
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      MSTLO_BENCH_HOST_CPU: ${MSTLO_BENCH_HOST_CPU:-}
+    volumes:
+      - type: bind
+        source: ./results
+        target: /results
+      # See the note on the multi-robot service: the configs come from the
+      # working tree so that editing one does not need a rebuild.
+      - type: bind
+        source: ./benchmarks/synthetic_signal/configs
+        target: /opt/stages/synthetic_signal/configs
+        read_only: true
+
+  # Monitoring a recorded digital-twin temperature trace.  `gather` re-records
+  # that trace from the live twin and is the reason for the broker below; `run`
+  # and `analyze` do not use it, and start it only because compose brings up a
+  # service's dependencies whichever of its stages is asked for.
+  incubator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mstlo
+      target: incubator
+      args:
+        RUST_VERSION: 1.95.0
+        IMAGE_VERSION: ${MSTLO_BENCH_IMAGE_VERSION:-dev}
+        REPOSITORY_REVISION: ${MSTLO_BENCH_REPOSITORY_REVISION:-unknown}
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /opt/mstlo
+    environment:
+      RESULTS_ROOT: /results
+      CARGO_NET_OFFLINE: "true"
+      RABBITMQ_HOST: rabbitmq
+      MPLBACKEND: Agg
+      MPLCONFIGDIR: /tmp/matplotlib
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      MSTLO_BENCH_HOST_CPU: ${MSTLO_BENCH_HOST_CPU:-}
+    volumes:
+      - type: bind
+        source: ./results
+        target: /results
+      - type: bind
+        source: ./benchmarks/incubator/configs
+        target: /opt/stages/incubator/configs
+        read_only: true
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  # The incubator's broker.  Not a benchmark, so not one of the three above.
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER:-incubator}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS:-incubator}"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

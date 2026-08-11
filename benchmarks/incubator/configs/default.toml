@@ -1,0 +1,18 @@
+# Reproduces the measurements committed under the mstlo checkout's
+# benchmarks/incubator/data/.
+
+[common]
+PHASES = "normal,lid_open"
+
+[gather]
+WARMUP_CYCLES = 1
+NORMAL_CYCLES = 3
+LID_DURATION = 1200
+
+[run]
+M_RUNS = 50
+WARMUP_RUNS = 1
+# Median over this many untimed passes; total_size() is not reproducible in one.
+MEMORY_RUNS = 50
+
+[analyze]

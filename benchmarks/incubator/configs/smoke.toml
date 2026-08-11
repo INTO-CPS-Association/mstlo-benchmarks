@@ -1,0 +1,23 @@
+# The shortest recording that still exercises every phase of gather.
+#
+# It is not quick in absolute terms: the emulator starts the box at 30 C and
+# runs in real time, so the pre-heat into the control band costs ~15 minutes
+# before the first useful sample no matter what is set here.  Expect ~20 min.
+#
+# The result is a valid but very short session -- fine for proving the gather ->
+# run handoff, useless as a measurement.
+
+[common]
+PHASES = "normal,lid_open"
+
+[gather]
+WARMUP_CYCLES = 0
+NORMAL_CYCLES = 1
+LID_DURATION = 60
+
+[run]
+M_RUNS = 2
+WARMUP_RUNS = 0
+MEMORY_RUNS = 3
+
+[analyze]
