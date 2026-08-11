@@ -27,6 +27,15 @@ services:
       - type: bind
         source: ./results
         target: /results
+      # The configs are the knobs, and they are read from the working tree
+      # rather than from the copy the image was built with, so editing one takes
+      # effect on the next stage instead of on the next `docker compose build`.
+      # Everything else in the stage layer is code and still comes from the
+      # image.
+      - type: bind
+        source: ./benchmarks/multi_robot/configs
+        target: /opt/stages/multi_robot/configs
+        read_only: true
 
   # The two benchmarks vendored from the mstlo repository.  No ROS, so they get
   # their own, much smaller image.
@@ -54,6 +63,16 @@ services:
       - type: bind
         source: ./results
         target: /results
+      # See the note on the multi-robot service: the configs come from the
+      # working tree so that editing one does not need a rebuild.
+      - type: bind
+        source: ./benchmarks/incubator/configs
+        target: /opt/stages/incubator/configs
+        read_only: true
+      - type: bind
+        source: ./benchmarks/synthetic_signal/configs
+        target: /opt/stages/synthetic_signal/configs
+        read_only: true
 
   # Only for re-recording the incubator session; needs the broker.
   gather:
@@ -78,6 +97,10 @@ services:
       - type: bind
         source: ./results
         target: /results
+      - type: bind
+        source: ./benchmarks/incubator/configs
+        target: /opt/stages/incubator/configs
+        read_only: true
     depends_on:
       rabbitmq:
         condition: service_healthy

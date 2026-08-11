@@ -103,12 +103,10 @@ The output lock stays active, so concurrent writers fail immediately.
 
 ## Custom configurations
 
-A configuration added under `configs/` is picked up by a rebuild and named like any other. To try one without rebuilding, mount it over the configs the image already has:
+`configs/` is bind-mounted into the image, so a configuration added there — or an edit to one already there — is picked up by the next stage and named like any other, with no rebuild:
 
 ```bash
-docker compose run --rm \
-  -v "$PWD/benchmarks/multi_robot/configs/custom.toml:/opt/stages/multi_robot/configs/custom.toml:ro" \
-  benchmark run multi_robot custom
+docker compose run --rm benchmark run multi_robot custom
 ```
 
 The unit tests — the driver's, and the shared stage layer's — run inside the image with:

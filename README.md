@@ -54,6 +54,8 @@ Everything else at the top level is a vendored upstream checkout — see [where 
 docker compose run --rm bench run incubator quick
 ```
 
+The `configs/` directories are bind-mounted from the working tree, so editing a config — or adding one — takes effect on the next stage. Everything else in the image is code and still needs `docker compose build`.
+
 Anything set in the environment wins over the file:
 
 ```bash
