@@ -7,16 +7,16 @@ By default the sweep is the paper's: four fixed formulas plus three families —
 Everything in that paragraph is a setting. What is measured — which bounds, which formulas, which signal — is decided by the config and written to `formulas.tsv` in the results, and both monitors are pointed at it; neither carries a catalog of its own any more.
 
 ```bash
-docker compose run --rm bench run     synthetic_signal
-docker compose run --rm bench analyze synthetic_signal
+docker compose run --rm synthetic_signal run
+docker compose run --rm synthetic_signal analyze
 ```
 
-`run` generates the signal and measures; `analyze` produces the regression fits, the Mann-Whitney table and the plots, and finds its own input files. The two are separate so the figures can be redrawn without measuring again.
+`run` generates the signal and measures; `analyze` produces the regression fits, the Mann-Whitney table and the plots, and finds its own input files. The two are separate so the figures can be redrawn without measuring again. `test` is a third stage, running the shared stage layer's tests and this benchmark's own — the catalog and the signal builders — inside the image.
 
 **The default configuration takes hours.** Check the pipeline first:
 
 ```bash
-docker compose run --rm bench run synthetic_signal quick
+docker compose run --rm synthetic_signal run quick
 ```
 
 ## Configuration
@@ -24,8 +24,8 @@ docker compose run --rm bench run synthetic_signal quick
 `configs/default.toml` reproduces the measurements the paper reports; `configs/quick.toml` proves the pipeline works and says nothing about performance. Anything set in the environment overrides the file, so a one-off variation needs no new config:
 
 ```bash
-docker compose run --rm bench -e SIGNAL_TYPES=chirp,constant -e BOUND_HIGH=2000 \
-    run synthetic_signal
+docker compose run --rm -e SIGNAL_TYPES=chirp,constant -e BOUND_HIGH=2000 \
+    synthetic_signal run
 ```
 
 ### The signal
@@ -122,6 +122,14 @@ A run measuring several signal types has one `mstlo/<type>/` and one `data_analy
 
 The cache-size pass reads a counter inside the timed loop, so its timings are not comparable with the ones above and go to their own file. One pass is enough: the step counts are deterministic.
 
-## RTAMT
+## Layout
 
-The paper also compares against RTAMT. This image ships no RTAMT, so `rtamt_benchmark.py` is never invoked, and the analysis stage skips the combined `performance_comparison_w_rtamt` plot, two of the three Mann-Whitney tests, and all 11 `rtamt_plots`. Everything measuring `mstlo` and `mstlo-python` is produced in full.
+```text
+benchmarks/synthetic_signal/
+├── configs/       the TOML settings below: default, quick
+├── run.sh         the measuring stage
+├── analyze.sh     the analysing stage
+├── formulas.py    the catalog the config builds
+├── signals.py     the signal the config builds
+└── tests/         what the two above are pinned to
+```

@@ -5,14 +5,14 @@
 # 3 s, so even the shortest session spends ~15 minutes pre-heating the box from
 # 30 C into the control band before the first useful sample.
 #
-# Only works in the `gather` image, which has the course at $COURSE_ROOT.
-# run.sh picks up the signal.csv this writes.
+# The incubator image carries the course at $COURSE_ROOT for this stage's
+# sake alone.  run.sh picks up the signal.csv this writes.
 
 set -e
 
 SRC="$MSTLO_SRC/incubator"
 RESULTS_DIR="${RESULTS_DIR:?set RESULTS_DIR}"
-COURSE_ROOT="${COURSE_ROOT:?set COURSE_ROOT -- use the gather image}"
+COURSE_ROOT="${COURSE_ROOT:?set COURSE_ROOT -- the incubator image sets it}"
 
 # The course pins older versions than the analysis needs, so its services and
 # run_experiment.py get their own interpreter.

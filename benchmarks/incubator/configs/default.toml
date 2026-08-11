@@ -2,8 +2,6 @@
 # benchmarks/incubator/data/.
 
 [common]
-# The committed artefacts cover these two phases (n = 989).  Empty is the whole
-# session (n = 1337), which matches nothing on disk.
 PHASES = "normal,lid_open"
 
 [gather]

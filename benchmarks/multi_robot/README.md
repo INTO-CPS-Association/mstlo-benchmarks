@@ -8,11 +8,11 @@ first valid verdict arrival - earliest time the semantics permits a verdict
 
 Later RoSI refinements at the same property/timestamp are ignored, so every semantics is weighted the same. Delayed semantics exclude their required waiting period; eager and robustness-interval semantics have no fixed wait. A run fails if a verdict has the wrong payload type.
 
-This is the one benchmark that needs ROS 2, so it has its own image (`docker/Dockerfile`) and its own compose service, `benchmark`. Everything else about running it is what the other two do:
+This is the one benchmark that needs ROS 2, so its image is built by `docker/Dockerfile` rather than the one the other two share. Everything else about running it is what they do — the compose service is the benchmark, and a command names the stage:
 
 ```bash
-docker compose run --rm benchmark run     multi_robot quick
-docker compose run --rm benchmark analyze multi_robot
+docker compose run --rm multi_robot run     quick
+docker compose run --rm multi_robot analyze
 ```
 
 `run` allocates a fresh result directory, measures both the direct and the ROS points, and prints where everything went; `analyze` turns that into the report. A failed benchmark point makes the container exit nonzero, and the measurements it did take are still there to analyse.
@@ -37,13 +37,13 @@ Both binaries monitor with the vendored `mstlo/` subtree, so this benchmark meas
 
 ```bash
 docker compose build
-docker compose run --rm benchmark run multi_robot quick
+docker compose run --rm multi_robot run quick
 ```
 
 The combined form works too:
 
 ```bash
-docker compose run --rm --build benchmark run multi_robot quick
+docker compose run --rm --build multi_robot run quick
 ```
 
 The build is deliberately multi-stage. Compilation happens only during `docker compose build`; benchmark commands use the prebuilt binaries and never download dependencies or compile code.
@@ -51,8 +51,8 @@ The build is deliberately multi-stage. Compilation happens only during `docker c
 ## Named configurations
 
 ```bash
-docker compose run --rm benchmark run multi_robot small
-docker compose run --rm benchmark run multi_robot overnight
+docker compose run --rm multi_robot run small
+docker compose run --rm multi_robot run overnight
 ```
 
 The config names a file under `configs/`. `quick` proves the pipeline works and says nothing about performance; `default` — used when no config is named — runs the sweep the paper reports.
@@ -80,9 +80,9 @@ The directory is printed when the stage starts. The report is one CSV, one Markd
 `analyze` writes into the newest run, so a report can be redrawn at any time without measuring again. Name a run — or a config, or `latest`, or a path — to report on that one instead, and `REPORT_DIR` puts the files somewhere else:
 
 ```bash
-docker compose run --rm benchmark analyze multi_robot small
-docker compose run --rm benchmark analyze multi_robot quick-20260809T120000Z-a1b2c3d4
-docker compose run --rm -e REPORT_DIR=/results/my-report benchmark analyze multi_robot
+docker compose run --rm multi_robot analyze small
+docker compose run --rm multi_robot analyze quick-20260809T120000Z-a1b2c3d4
+docker compose run --rm -e REPORT_DIR=/results/my-report multi_robot analyze
 ```
 
 `metadata.json` records what produced the numbers, in the shape all three benchmarks use: see the [repository README](../../README.md#what-the-three-share). ROS distribution and middleware are in there too; fields a platform cannot supply are `null`.
@@ -96,7 +96,7 @@ A run always gets a fresh directory, so there is normally nothing to append to. 
 ```bash
 docker compose run --rm \
   -e RESULTS_DIR=/results/multi_robot/small-20260809T120000Z-a1b2c3d4 -e RESUME=1 \
-  benchmark run multi_robot small
+  multi_robot run small
 ```
 
 The output lock stays active, so concurrent writers fail immediately.
@@ -106,13 +106,13 @@ The output lock stays active, so concurrent writers fail immediately.
 `configs/` is bind-mounted into the image, so a configuration added there — or an edit to one already there — is picked up by the next stage and named like any other, with no rebuild:
 
 ```bash
-docker compose run --rm benchmark run multi_robot custom
+docker compose run --rm multi_robot run custom
 ```
 
 The unit tests — the driver's, and the shared stage layer's — run inside the image with:
 
 ```bash
-docker compose run --rm benchmark test
+docker compose run --rm multi_robot test
 ```
 
 ## Linux output ownership
@@ -121,7 +121,7 @@ Compose defaults to UID/GID `1000`, which suits the common Linux setup and works
 
 ```bash
 HOST_UID="$(id -u)" HOST_GID="$(id -g)" \
-  docker compose run --rm benchmark run multi_robot quick
+  docker compose run --rm multi_robot run quick
 ```
 
 No host networking, host IPC, privileged mode, host devices, Docker socket, GPU, X11, EMQX, or desktop ROS installation is used. ROS/DDS communication stays inside the container with localhost-only discovery and a fixed Fast DDS implementation.
@@ -133,8 +133,8 @@ The Docker workflow is the supported reproducible path. Local runs remain availa
 ```bash
 uv sync --extra dev
 source /opt/ros/jazzy/setup.bash
-benchmarks/entrypoint.sh run     multi_robot quick
-benchmarks/entrypoint.sh analyze multi_robot
+BENCH=multi_robot benchmarks/entrypoint.sh run     quick
+BENCH=multi_robot benchmarks/entrypoint.sh analyze
 ```
 
 The same entrypoint, the same layout under `results/`; only the ROS environment has to be arranged by hand, and `RESULTS_ROOT` defaults to the repository's own `results/` rather than `/results`. The driver underneath can also be called directly, which is what the stage scripts do:

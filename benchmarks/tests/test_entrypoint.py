@@ -51,6 +51,12 @@ def bench_root(tmp_path):
 
 @pytest.fixture
 def entrypoint(bench_root, tmp_path):
+    """Invoke the stage layer the way a compose service does.
+
+    The service is the benchmark, so `demo` arrives in the environment rather
+    than on the command line, exactly as the image sets it.
+    """
+
     def invoke(*arguments, expect=0, **environment):
         completed = subprocess.run(
             ["sh", str(bench_root / "entrypoint.sh"), *arguments],
@@ -58,6 +64,7 @@ def entrypoint(bench_root, tmp_path):
             text=True,
             env={
                 "PATH": PATH,
+                "BENCH": "demo",
                 "RESULTS_ROOT": str(tmp_path / "results"),
                 **environment,
             },
@@ -84,8 +91,8 @@ def metadata(directory):
 
 
 def test_a_run_gets_a_directory_of_its_own(entrypoint, tmp_path):
-    entrypoint("run", "demo")
-    entrypoint("run", "demo", "quick")
+    entrypoint("run")
+    entrypoint("run", "quick")
 
     first, second = sorted(directories(tmp_path), key=lambda p: p.name)
     assert first.name.startswith("default-")
@@ -96,7 +103,7 @@ def test_a_run_gets_a_directory_of_its_own(entrypoint, tmp_path):
 
 
 def test_a_run_records_what_produced_it(entrypoint, tmp_path):
-    entrypoint("run", "demo", "quick")
+    entrypoint("run", "quick")
 
     (directory,) = directories(tmp_path)
     meta = metadata(directory)
@@ -114,7 +121,7 @@ def test_a_run_records_what_produced_it(entrypoint, tmp_path):
 
 
 def test_the_environment_overrides_the_config_and_is_recorded(entrypoint, tmp_path):
-    entrypoint("run", "demo", "quick", M_RUNS="7")
+    entrypoint("run", "quick", M_RUNS="7")
 
     (directory,) = directories(tmp_path)
     assert (directory / "measurements.csv").read_text() == "run 7\n"
@@ -131,7 +138,7 @@ def test_a_setting_can_be_a_list_and_arrives_one_entry_per_line(
     (bench_root / "demo" / "run.sh").write_text(
         '#!/usr/bin/env sh\nprintf "%s" "$FORMULAS" > "$RESULTS_DIR/measurements.csv"\n'
     )
-    entrypoint("run", "demo")
+    entrypoint("run")
 
     (directory,) = directories(tmp_path)
     assert (directory / "measurements.csv").read_text().splitlines() == [
@@ -142,16 +149,16 @@ def test_a_setting_can_be_a_list_and_arrives_one_entry_per_line(
 
 def test_a_failing_stage_is_recorded_and_propagated(entrypoint, bench_root, tmp_path):
     (bench_root / "demo" / "run.sh").write_text("#!/usr/bin/env sh\nexit 3\n")
-    entrypoint("run", "demo", expect=3)
+    entrypoint("run", expect=3)
 
     (directory,) = directories(tmp_path)
     assert metadata(directory)["stages"][0]["status"] == "failed (3)"
 
 
 def test_analyze_lands_in_the_newest_run(entrypoint, tmp_path):
-    measured = written_to(entrypoint("run", "demo"))
-    gathered = written_to(entrypoint("gather", "demo"))
-    entrypoint("analyze", "demo")
+    measured = written_to(entrypoint("run"))
+    gathered = written_to(entrypoint("gather"))
+    entrypoint("analyze")
 
     # The gather is newer, but holds no measurements to analyse.
     assert (gathered / "signal.csv").exists()
@@ -164,9 +171,9 @@ def test_analyze_lands_in_the_newest_run(entrypoint, tmp_path):
 
 
 def test_analyze_can_be_narrowed_to_a_config(entrypoint, tmp_path):
-    entrypoint("run", "demo", "quick")
-    entrypoint("run", "demo", "default")
-    entrypoint("analyze", "demo", "quick")
+    entrypoint("run", "quick")
+    entrypoint("run", "default")
+    entrypoint("analyze", "quick")
 
     default, quick = sorted(directories(tmp_path), key=lambda p: p.name)
     assert (quick / "figure.pdf").exists()
@@ -174,46 +181,70 @@ def test_analyze_can_be_narrowed_to_a_config(entrypoint, tmp_path):
 
 
 def test_analyze_takes_the_run_it_is_pointed_at(entrypoint, tmp_path):
-    older = written_to(entrypoint("run", "demo", "quick"))
-    newer = written_to(entrypoint("run", "demo", "quick"))
+    older = written_to(entrypoint("run", "quick"))
+    newer = written_to(entrypoint("run", "quick"))
 
     # By the name printed when it ran, by an absolute path, and by `latest`.
-    entrypoint("analyze", "demo", older.name)
+    entrypoint("analyze", older.name)
     assert (older / "figure.pdf").exists()
     assert not (newer / "figure.pdf").exists()
 
     (older / "figure.pdf").unlink()
-    entrypoint("analyze", "demo", str(older))
+    entrypoint("analyze", str(older))
     assert (older / "figure.pdf").exists()
 
-    entrypoint("analyze", "demo", "latest")
+    entrypoint("analyze", "latest")
     assert (newer / "figure.pdf").exists()
 
 
 def test_analyze_says_so_when_there_is_nothing_to_analyse(entrypoint):
-    completed = entrypoint("analyze", "demo", expect=1)
+    completed = entrypoint("analyze", expect=1)
     assert "no run results for demo" in completed.stderr
 
 
-def test_a_third_argument_that_is_neither_is_rejected(entrypoint, tmp_path):
-    entrypoint("run", "demo", "quick")
+def test_a_second_argument_that_is_neither_is_rejected(entrypoint, tmp_path):
+    entrypoint("run", "quick")
 
-    completed = entrypoint("analyze", "demo", "typo", expect=1)
+    completed = entrypoint("analyze", "typo", expect=1)
     assert "neither a config of demo nor a result directory" in completed.stderr
 
     # A measuring stage has nothing to point at, so it only takes a config.
-    completed = entrypoint("run", "demo", "typo", expect=1)
+    completed = entrypoint("run", "typo", expect=1)
     assert "no such config: demo/typo" in completed.stderr
 
 
 def test_an_explicit_results_directory_wins(entrypoint, tmp_path):
     chosen = tmp_path / "somewhere-else"
-    entrypoint("run", "demo", RESULTS_DIR=str(chosen))
+    entrypoint("run", RESULTS_DIR=str(chosen))
 
     assert (chosen / "measurements.csv").exists()
     assert not (tmp_path / "results" / "demo").exists()
 
 
-def test_a_benchmark_from_another_image_says_which_one(entrypoint):
+def test_a_benchmark_named_where_a_config_goes_says_which_service_it_is(entrypoint):
+    """The service is the benchmark, so naming one here is a command for another.
+
+    Both halves of the old two-argument habit end up here: the benchmark this
+    service already is, and one of the others.
+    """
     completed = entrypoint("run", "multi_robot", expect=2)
-    assert "runs in the 'benchmark' one" in completed.stderr
+    assert "docker compose run --rm multi_robot run" in completed.stderr
+
+    completed = entrypoint("run", "demo", expect=2)
+    assert "the service already is demo" in completed.stderr
+
+
+def test_the_image_has_to_say_which_benchmark_it_holds(entrypoint):
+    completed = entrypoint("run", expect=2, BENCH="")
+    assert "does not say which benchmark" in completed.stderr
+
+
+def test_no_arguments_lists_what_this_service_can_do(entrypoint):
+    completed = entrypoint(expect=1)
+
+    assert "demo" in completed.stderr
+    # Its own stages, the test stage every benchmark has, and its configs.
+    for word in ("gather", "run", "analyze", "test", "default", "quick"):
+        assert word in completed.stderr
+    # And where the other benchmarks went.
+    assert "docker compose run --rm incubator" in completed.stderr

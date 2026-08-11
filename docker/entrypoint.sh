@@ -27,12 +27,11 @@ export IDL_PACKAGE_FILTER="${IDL_PACKAGE_FILTER:-std_msgs;geometry_msgs;nav_msgs
 
 # Everything above is what this image adds: ROS on the path.  What to run is
 # then decided exactly as it is for the other two benchmarks, by the shared
-# stage layer -- `<stage> <benchmark> [config]`, with no arguments listing what
-# there is.
-if (( $# == 0 )) || [[ "${1}" == "gather" || "${1}" == "run" || "${1}" == "analyze" ]]; then
+# stage layer -- `<stage> [config]`, with no arguments listing what there is.
+if (( $# == 0 )) || [[ "${1}" == "gather" || "${1}" == "run" || "${1}" == "analyze" || "${1}" == "test" ]]; then
     exec /opt/stages/entrypoint.sh "$@"
 fi
 
-# The benchmark's own tool, for the things that are not a stage: `test`, and
-# `report --output-dir` against a directory of one's choosing.
+# The benchmark's own tool, for the one thing that is not a stage: `report
+# --output-dir` against a directory of one's choosing.
 exec /opt/venv/bin/mstlo-bench "$@"

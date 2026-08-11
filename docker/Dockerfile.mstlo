@@ -2,18 +2,20 @@
 # vendors as the mstlo/ subtree.  The multi-robot benchmark has its own image
 # (docker/Dockerfile) because it needs ROS 2 and this one does not.
 #
-#   docker compose run --rm bench   run     synthetic_signal
-#   docker compose run --rm bench   analyze incubator
-#   docker compose run --rm gather  gather  incubator
+#   docker compose run --rm synthetic_signal run
+#   docker compose run --rm incubator        analyze
+#   docker compose run --rm incubator        gather
 #
-# Two targets: `bench` runs and analyses; `gather` adds the course services and
-# their dependencies so a fresh incubator session can be recorded.
+# One image per benchmark, so a compose service is a benchmark and nothing has
+# to say which one at run time.  Both are built on a shared `base` that carries
+# everything expensive -- the venv, the mstlo checkout and the compiled benches
+# -- so the second image costs almost nothing on top of the first.
 
 ARG RUST_VERSION=1.95.0
 ARG IMAGE_VERSION=dev
 ARG REPOSITORY_REVISION=unknown
 
-FROM rust:${RUST_VERSION}-bookworm AS bench
+FROM rust:${RUST_VERSION}-bookworm AS base
 ARG IMAGE_VERSION
 ARG REPOSITORY_REVISION
 
@@ -41,17 +43,14 @@ RUN cd /opt/mstlo/mstlo \
     && cargo bench --locked --no-run --bench paper_benchmark --bench incubator_benchmark \
          --features track-cache-size
 
-# This repository's stage layer.  It lives outside the subtree so that a
-# `git subtree pull` never has to merge anything this repository wrote, and it
-# is copied after the compile above so that editing a stage script or a config
-# does not rebuild the benches.
-#
-# Only the two benchmarks this image runs, plus the files they share.  The third
-# benchmark, benchmarks/multi_robot, needs ROS 2 and is built by docker/Dockerfile.
+# This repository's stage layer, without any one benchmark's part of it: the
+# procedure every benchmark is driven by, and the tests that pin it down.  It
+# lives outside the subtree so that a `git subtree pull` never has to merge
+# anything this repository wrote, and it is copied after the compile above so
+# that editing a stage script or a config does not rebuild the benches.
 COPY benchmarks/entrypoint.sh benchmarks/config.py benchmarks/metadata.py \
     benchmarks/results.py /opt/stages/
-COPY benchmarks/synthetic_signal /opt/stages/synthetic_signal
-COPY benchmarks/incubator /opt/stages/incubator
+COPY benchmarks/tests /opt/stages/tests
 
 ENV RESULTS_ROOT=/results \
     MSTLO_ROOT=/opt/mstlo \
@@ -76,7 +75,26 @@ CMD []
 
 
 # ---------------------------------------------------------------------------
-FROM bench AS gather
+# The synthetic-signal benchmark: the base plus its own stage scripts, configs
+# and tests, and $BENCH saying that is what this image is.
+FROM base AS synthetic_signal
+
+COPY benchmarks/synthetic_signal /opt/stages/synthetic_signal
+RUN chmod -R a+rX /opt/stages/synthetic_signal
+
+ENV BENCH=synthetic_signal
+
+
+# ---------------------------------------------------------------------------
+# The incubator benchmark.  Its `run` and `analyze` need no more than the base
+# does, but its `gather` re-records the session from the live digital twin, so
+# this image also carries the course services and their dependencies.
+FROM base AS incubator
+
+COPY benchmarks/incubator /opt/stages/incubator
+RUN chmod -R a+rX /opt/stages/incubator
+
+ENV BENCH=incubator
 
 # run_experiment.py lives in the mstlo subtree and must stay byte-exact so that
 # subtree pulls stay conflict-free.  It resolves the course checkout as

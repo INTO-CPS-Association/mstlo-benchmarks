@@ -126,8 +126,8 @@ ENV ROS_DISTRO=${ROS_DISTRO} \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     IDL_PACKAGE_FILTER=std_msgs\;geometry_msgs\;nav_msgs\;id_pose_msgs\;robo_sapiens_interfaces \
     ROS_LOG_DIR=/tmp/mstlo-bench-ros \
+    BENCH=multi_robot \
     MSTLO_BENCH_ROOT=/opt/stages/multi_robot \
-    MSTLO_BENCH_TESTS_DIR=/opt/stages \
     RESULTS_ROOT=/results \
     MSTLO_BENCH_PREBUILT=1 \
     MSTLO_RUNNER_BIN=/usr/local/bin/mstlo-benchmark-runner \
@@ -160,9 +160,10 @@ COPY --from=build /src/robosapiens-trustworthiness-checker/ros_interfaces/instal
 COPY --from=build /src/benchmarks/multi_robot/runner/target/bench-fast/mstlo-benchmark-runner /usr/local/bin/mstlo-benchmark-runner
 COPY --from=build /src/robosapiens-trustworthiness-checker/target/bench-fast/trustworthiness_checker /usr/local/bin/trustworthiness_checker
 
-# The stage layer, byte for byte the one in the other image: the same entrypoint
+# The stage layer, byte for byte the one in the other images: the same entrypoint
 # decides the same things for all three benchmarks, and only the stage scripts
-# below it differ.
+# below it differ.  This image holds one benchmark, multi_robot, and $BENCH above
+# says so.
 COPY benchmarks/entrypoint.sh benchmarks/config.py benchmarks/metadata.py \
     benchmarks/results.py /opt/stages/
 COPY benchmarks/tests /opt/stages/tests

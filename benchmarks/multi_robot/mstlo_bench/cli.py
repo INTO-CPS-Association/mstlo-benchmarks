@@ -8,15 +8,11 @@ benchmarks alike, so both commands here take the directory they are given.
 from __future__ import annotations
 
 import argparse
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 from .benchmark import ROOT, run
 from .report import write_report
-
-TESTS_ROOT = Path(os.environ.get("MSTLO_BENCH_TESTS_DIR", ROOT / "tests"))
 
 
 def _add_resume_argument(parser: argparse.ArgumentParser) -> None:
@@ -43,15 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
     report = commands.add_parser("report", help="generate the latency report")
     report.add_argument("--output-dir", type=Path, required=True)
     report.add_argument("--report-dir", type=Path)
-
-    test = commands.add_parser("test", help="run the Python unit tests in the image")
-    test.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser
-
-
-def _run_tests(arguments: list[str]) -> int:
-    command = [sys.executable, "-m", "pytest", str(TESTS_ROOT), *arguments]
-    return subprocess.run(command, check=False).returncode
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -62,12 +50,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.config.resolve(), args.output_dir.resolve(), resume=args.resume
             )
             return 0 if rows and all(row["ok"] for row in rows) else 1
-        if args.command == "report":
-            outputs = write_report(args.output_dir.resolve(), args.report_dir)
-            for path in outputs:
-                print(path)
-            return 0
-        return _run_tests(args.pytest_args)
+        outputs = write_report(args.output_dir.resolve(), args.report_dir)
+        for path in outputs:
+            print(path)
+        return 0
     except (OSError, RuntimeError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1

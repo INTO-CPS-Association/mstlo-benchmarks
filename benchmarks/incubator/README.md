@@ -3,14 +3,14 @@
 Monitoring a real digital twin's temperature trace. A recorded session from the [incubator digital-twin course](https://github.com/clagms/IncubatorDTCourse) is replayed through two STL specifications; the monitors are timed on it, and the native monitor's memory footprint is recorded after every update.
 
 ```bash
-docker compose run --rm bench run     incubator
-docker compose run --rm bench analyze incubator
+docker compose run --rm incubator run
+docker compose run --rm incubator analyze
 ```
 
 This works out of the box: the recording used in the paper is committed in the `mstlo/` subtree, and `run` copies it in when there has been no `gather` — it says which one it used, in the log and in the metadata. `analyze` draws the figures from the newest `run`, or from whichever one it is named:
 
 ```bash
-docker compose run --rm bench analyze incubator quick-20260809T120000Z-a1b2c3d4
+docker compose run --rm incubator analyze quick-20260809T120000Z-a1b2c3d4
 ```
 
 ## Configuration
@@ -19,7 +19,7 @@ docker compose run --rm bench analyze incubator quick-20260809T120000Z-a1b2c3d4
 
 | setting | default | quick | meaning |
 | --- | --- | --- | --- |
-| `PHASES` | `normal,lid_open` | same | which phases of the recording every stage sees; empty is the whole session |
+| `PHASES` | `normal,lid_open` | same | which phases of the recording every stage sees; empty is the whole session (preheat, warmup, normal, lid_open) |
 | `M_RUNS` | 50 | 2 | timed repetitions per point |
 | `WARMUP_RUNS` | 1 | 0 | untimed repetitions before each point |
 | `MEMORY_RUNS` | 50 | 3 | untimed passes the memory median is taken over |
@@ -43,22 +43,20 @@ The cache-size pass reads a counter after every update, inside the timed loop, s
 
 ## Recording a fresh session
 
-The `gather` stage drives the course's real emulator and controller over RabbitMQ and records a new session. The broker is a compose service, the course and its submodule are vendored as subtrees, and the two notebook-generated service scripts are committed under `course-services/` — so there is nothing to clone, extract or step through:
+The `gather` stage drives the course's real emulator and controller over RabbitMQ and records a new session. The broker is a compose service this one depends on, the course and its submodule are vendored as subtrees, and the two notebook-generated service scripts are committed under `course-services/` — so there is nothing to clone, extract or step through:
 
 ```bash
-docker compose run --rm gather gather incubator
+docker compose run --rm incubator gather
 ```
 
 **This takes about 70 minutes.** The emulator runs in real time at one sample every 3 s, and the box starts at 30 °C, so roughly the first 15 minutes go into pre-heating up to the control band before any useful sample appears. A shorter session that still exercises every phase — pre-heat, warm-up, normal, lid-open — takes about 20 minutes:
 
 ```bash
-docker compose run --rm gather gather incubator smoke
+docker compose run --rm incubator gather smoke
 ```
 
 A `gather` gets a fresh directory of its own, exactly as a `run` does, and afterwards every `run` copies its `signal.csv` in instead of the committed one — the newest recording wins, and the run's metadata names the one it used. To replay an older recording, copy its `signal.csv` into a result directory and point `run` at it with `RESULTS_DIR`.
 
 `gather` has its own knobs: `WARMUP_CYCLES` (1), `NORMAL_CYCLES` (3) and `LID_DURATION` (1200 s) — `smoke` sets 0, 1 and 60.
 
-## RTAMT
-
-The paper also compares against RTAMT. This image ships no RTAMT, so the benchmark stage always passes `--no-rtamt` and nothing imports it.
+Because `gather` is a stage of this service rather than a service of its own, the image carries the course and its interpreter, and compose starts the broker for every incubator command. `run` and `analyze` ignore both.

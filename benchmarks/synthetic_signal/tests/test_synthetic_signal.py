@@ -6,22 +6,27 @@ pin the two things that move: that the defaults still produce the paper's sweep
 and the paper's signal, and that the settings around them do what they say.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-SYNTHETIC = Path(__file__).resolve().parents[1] / "synthetic_signal"
+SYNTHETIC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SYNTHETIC))
 
 import formulas  # noqa: E402
 import signals  # noqa: E402
 
 # The upstream generator the new one has to agree with, in the mstlo subtree.
+# The image says where that checkout is; in a working tree it is alongside
+# benchmarks/, at the repository root.
+MSTLO_ROOT = Path(
+    os.environ.get("MSTLO_ROOT", Path(__file__).resolve().parents[3] / "mstlo")
+)
 UPSTREAM_GENERATOR = (
-    Path(__file__).resolve().parents[2]
-    / "mstlo"
+    MSTLO_ROOT
     / "benchmarks"
     / "synthetic_signal"
     / "signal_generation"
