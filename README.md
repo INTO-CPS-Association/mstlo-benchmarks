@@ -115,7 +115,3 @@ Every benchmarked component is vendored as a `git subtree`:
 | `multi-robot-runtime-verification/` | the Brownian multi-robot simulator | [GitHub](https://github.com/INTO-CPS-Association/multi-robot-runtime-verification) |
 | `incubator-dt-course/` | the incubator digital-twin course | [GitHub](https://github.com/clagms/IncubatorDTCourse) |
 | `example-digital-twin-incubator/` | the course's `incubator_dt` submodule, vendored separately because a subtree does not carry submodules |[GitHub](https://github.com/INTO-CPS-Association/example_digital-twin_incubator/tree/master)|
-
-<!-- ## About the numbers
-
-RTAMT is deliberately **not** installed. The version the paper compares against is not on PyPI, needs a separate cmake/Boost.Python build for its C++ backend, and needs a fix that is not upstream — three failure modes that would make this repository worse at its one job. The comparison plots against RTAMT therefore do not appear here; the full recipe for reproducing them is in the [mstlo repository](https://github.com/INTO-CPS-Association/mstlo/blob/main/benchmarks/synthetic_signal/README.md#installing-rtamt). -->
