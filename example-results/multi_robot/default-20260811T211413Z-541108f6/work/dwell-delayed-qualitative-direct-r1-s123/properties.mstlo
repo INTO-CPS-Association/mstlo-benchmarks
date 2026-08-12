@@ -1,0 +1,1 @@
+dwell_0: G[0,10]((robot_0_x > -9 && robot_0_x < 1 && robot_0_y > -11 && robot_0_y < -1) -> F[0,5](!(robot_0_x > -9 && robot_0_x < 1 && robot_0_y > -11 && robot_0_y < -1)))

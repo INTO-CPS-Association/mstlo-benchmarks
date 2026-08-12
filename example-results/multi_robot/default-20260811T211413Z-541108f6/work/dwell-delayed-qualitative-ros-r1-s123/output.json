@@ -1,0 +1,6 @@
+{
+  "dwell_0": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_0",
+    "msg_type": "MstloTimedValue"
+  }
+}

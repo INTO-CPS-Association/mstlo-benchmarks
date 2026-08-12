@@ -1,0 +1,42 @@
+{
+  "dwell_0": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_0",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_1": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_1",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_2": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_2",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_3": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_3",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_4": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_4",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_5": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_5",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_6": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_6",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_7": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_7",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_8": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_8",
+    "msg_type": "MstloTimedValue"
+  },
+  "dwell_9": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/dwell_9",
+    "msg_type": "MstloTimedValue"
+  }
+}

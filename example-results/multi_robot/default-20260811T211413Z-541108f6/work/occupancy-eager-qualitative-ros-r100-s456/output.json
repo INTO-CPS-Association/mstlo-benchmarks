@@ -1,0 +1,6 @@
+{
+  "occupancy_vertical_lift": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/occupancy_vertical_lift",
+    "msg_type": "MstloTimedValue"
+  }
+}

@@ -1,0 +1,1 @@
+confined_0: robot_0_x > -8.88 && robot_0_x < 8.38 && robot_0_y > -10.88 && robot_0_y < 7.88

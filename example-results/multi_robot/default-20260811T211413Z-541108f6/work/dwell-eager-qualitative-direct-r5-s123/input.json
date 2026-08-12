@@ -1,0 +1,42 @@
+{
+  "robot_0_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_0/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_0_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_0/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_1_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_1/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_1_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_1/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_2_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_2/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_2_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_2/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_3_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_3/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_3_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_3/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_4_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_4/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_4_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_4/y",
+    "msg_type": "MstloTimedValue"
+  }
+}

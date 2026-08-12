@@ -1,0 +1,44 @@
+{
+  "benchmark": "multi_robot",
+  "environment": {
+    "container": true,
+    "image_version": "dev",
+    "repository_revision": "unknown",
+    "arch": "x86_64",
+    "cpu": "Intel(R) Core(TM) Ultra 7 155H",
+    "cpus": 22,
+    "memory_limit_bytes": null,
+    "kernel": {
+      "system": "Linux",
+      "release": "7.1.7-arch1-1",
+      "version": "#1 SMP PREEMPT_DYNAMIC Thu, 06 Aug 2026 20:27:00 +0000",
+      "machine": "x86_64"
+    },
+    "python": "3.12.3",
+    "rustc": null,
+    "ros_distribution": "jazzy",
+    "ros_middleware": "rmw_fastrtps_cpp"
+  },
+  "stages": [
+    {
+      "stage": "run",
+      "config": "default",
+      "config_sha256": "6348fea335bf3b88d4f11be324372c22c587e4c92fe5e1f7b093c828adec9927",
+      "started_utc": "2026-08-11T21:14:13Z",
+      "completed_utc": "2026-08-11T23:35:39Z",
+      "status": "failed (1)",
+      "settings": {},
+      "inputs": {}
+    },
+    {
+      "stage": "analyze",
+      "config": "default",
+      "config_sha256": "6348fea335bf3b88d4f11be324372c22c587e4c92fe5e1f7b093c828adec9927",
+      "started_utc": "2026-08-12T06:14:54Z",
+      "completed_utc": "2026-08-12T06:14:56Z",
+      "status": "ok",
+      "settings": {},
+      "inputs": {}
+    }
+  ]
+}

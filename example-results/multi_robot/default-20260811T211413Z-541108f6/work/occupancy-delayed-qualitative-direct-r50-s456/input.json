@@ -1,0 +1,402 @@
+{
+  "robot_0_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_0/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_0_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_0/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_1_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_1/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_1_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_1/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_2_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_2/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_2_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_2/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_3_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_3/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_3_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_3/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_4_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_4/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_4_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_4/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_5_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_5/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_5_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_5/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_6_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_6/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_6_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_6/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_7_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_7/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_7_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_7/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_8_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_8/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_8_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_8/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_9_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_9/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_9_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_9/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_10_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_10/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_10_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_10/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_11_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_11/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_11_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_11/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_12_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_12/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_12_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_12/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_13_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_13/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_13_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_13/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_14_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_14/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_14_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_14/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_15_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_15/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_15_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_15/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_16_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_16/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_16_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_16/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_17_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_17/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_17_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_17/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_18_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_18/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_18_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_18/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_19_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_19/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_19_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_19/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_20_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_20/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_20_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_20/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_21_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_21/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_21_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_21/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_22_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_22/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_22_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_22/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_23_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_23/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_23_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_23/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_24_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_24/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_24_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_24/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_25_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_25/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_25_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_25/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_26_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_26/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_26_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_26/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_27_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_27/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_27_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_27/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_28_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_28/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_28_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_28/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_29_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_29/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_29_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_29/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_30_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_30/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_30_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_30/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_31_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_31/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_31_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_31/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_32_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_32/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_32_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_32/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_33_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_33/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_33_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_33/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_34_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_34/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_34_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_34/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_35_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_35/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_35_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_35/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_36_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_36/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_36_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_36/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_37_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_37/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_37_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_37/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_38_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_38/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_38_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_38/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_39_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_39/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_39_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_39/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_40_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_40/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_40_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_40/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_41_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_41/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_41_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_41/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_42_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_42/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_42_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_42/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_43_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_43/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_43_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_43/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_44_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_44/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_44_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_44/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_45_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_45/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_45_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_45/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_46_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_46/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_46_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_46/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_47_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_47/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_47_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_47/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_48_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_48/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_48_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_48/y",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_49_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_49/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_49_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_49/y",
+    "msg_type": "MstloTimedValue"
+  }
+}

@@ -1,13 +1,10 @@
 [benchmark]
-robots = [100, 50, 20, 10, 5, 1]
-seeds = [123, 456]
+robots = [10, 5]
+seeds = [123]
 property_sets = ["confined", "dwell", "occupancy"]
 transports = ["direct", "ros"]
 semantics = [
-  "delayed-qualitative",
-  "delayed-quantitative",
   "eager-qualitative",
-  "robustness-interval",
 ]
 algorithm = "incremental"
 duration_s = 20.0

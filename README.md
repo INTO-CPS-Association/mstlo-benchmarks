@@ -104,6 +104,20 @@ docker compose run --rm synthetic_signal test
 docker compose run --rm multi_robot      test -k report
 ```
 
+## Example results
+
+The multi-robot benchmark was run on an Intel Core Ultra 7 155H (22 cores, 7.1.7 kernel, Docker with cgroups v2) to produce a snapshot the authors cannot regenerate indefinitely — every benchmark is nondeterministic, and a run takes over two hours. The figures and data from that run live in `example-results/multi_robot/`.
+
+**[latency_overhead_fan_delayed-qualitative.png](example-results/multi_robot/default-20260811T211413Z-541108f6/report/latency_overhead_fan_delayed-qualitative.png)**  
+**[latency_overhead_fan_delayed-quantitative.png](example-results/multi_robot/default-20260811T211413Z-541108f6/report/latency_overhead_fan_delayed-quantitative.png)**  
+**[latency_overhead_fan_eager-qualitative.png](example-results/multi_robot/default-20260811T211413Z-541108f6/report/latency_overhead_fan_eager-qualitative.png)**  
+**[latency_overhead_fan_robustness-interval.png](example-results/multi_robot/default-20260811T211413Z-541108f6/report/latency_overhead_fan_robustness-interval.png)**  
+
+A few things about the eager-qualitative figures are worth calling out: the overhead numbers for the `dwell` and `occupancy` property sets are clearly wrong, in a way that suggests an arithmetic bug rather than a valid measurement. The other three semantics are consistent and plausible.
+
+For results on the synthetic-signal and incubator benchmarks we refer to the paper. The containers in this repository are the reproduction mechanism — they make it trivial to re-run every experiment — but the results reported in the paper were obtained directly on the host, without Docker.
+
+
 ## Where the code comes from
 
 Every benchmarked component is vendored as a `git subtree`:

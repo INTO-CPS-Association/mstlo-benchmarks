@@ -1,0 +1,82 @@
+{
+  "confined_0": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_0",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_1": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_1",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_2": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_2",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_3": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_3",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_4": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_4",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_5": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_5",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_6": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_6",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_7": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_7",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_8": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_8",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_9": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_9",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_10": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_10",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_11": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_11",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_12": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_12",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_13": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_13",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_14": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_14",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_15": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_15",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_16": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_16",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_17": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_17",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_18": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_18",
+    "msg_type": "MstloTimedValue"
+  },
+  "confined_19": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/verdict/confined_19",
+    "msg_type": "MstloTimedValue"
+  }
+}

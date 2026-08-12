@@ -1,0 +1,10 @@
+{
+  "robot_0_x": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_0/x",
+    "msg_type": "MstloTimedValue"
+  },
+  "robot_0_y": {
+    "topic": "/mstlo_bench_2e26b25b95e44788ba2ea9402b32401f/mstlo/robot_0/y",
+    "msg_type": "MstloTimedValue"
+  }
+}
