@@ -30,6 +30,9 @@ pub struct LatencySummary {
     pub latency_overhead_ms_p50: Option<f64>,
     pub latency_overhead_ms_p95: Option<f64>,
     pub latency_overhead_ms_p99: Option<f64>,
+    pub result_latency_ms_p50: Option<f64>,
+    pub result_latency_ms_p95: Option<f64>,
+    pub result_latency_ms_p99: Option<f64>,
 }
 
 impl LatencySummary {
@@ -101,10 +104,7 @@ impl LatencyTracker {
         }
         let published_ns = self.publications[timestamp_index].elapsed_ns;
         let elapsed_ns = self.elapsed_ns().saturating_sub(published_ns);
-        self.latencies[slot] = elapsed_ns
-            .saturating_sub(self.latency_baseline_ns)
-            .try_into()
-            .unwrap_or(i64::MAX);
+        self.latencies[slot] = elapsed_ns.try_into().unwrap_or(i64::MAX);
     }
 
     pub fn summary(&mut self, invalid_outputs: u64) -> LatencySummary {
@@ -116,22 +116,33 @@ impl LatencyTracker {
         self.latencies.sort_unstable();
         let samples = self.latencies.len() as u64;
         let expected_samples = expected_samples as u64;
-        let percentile = |fraction: f64| {
+        let percentile_ns = |fraction: f64| {
             if self.latencies.is_empty() {
                 return None;
             }
             let index =
                 ((self.latencies.len() as f64 * fraction) as usize).min(self.latencies.len() - 1);
-            Some(self.latencies[index] as f64 / 1_000_000.0)
+            self.latencies[index].try_into().ok()
+        };
+        let result_latency_percentile = |fraction| {
+            percentile_ns(fraction).map(|latency_ns: u64| latency_ns as f64 / 1_000_000.0)
+        };
+        let latency_overhead_percentile = |fraction| {
+            percentile_ns(fraction).map(|latency_ns: u64| {
+                latency_ns.saturating_sub(self.latency_baseline_ns) as f64 / 1_000_000.0
+            })
         };
         LatencySummary {
             latency_samples: samples,
             latency_expected_samples: expected_samples,
             latency_complete: samples == expected_samples && expected_samples > 0,
             latency_invalid_outputs: invalid_outputs,
-            latency_overhead_ms_p50: percentile(0.50),
-            latency_overhead_ms_p95: percentile(0.95),
-            latency_overhead_ms_p99: percentile(0.99),
+            latency_overhead_ms_p50: latency_overhead_percentile(0.50),
+            latency_overhead_ms_p95: latency_overhead_percentile(0.95),
+            latency_overhead_ms_p99: latency_overhead_percentile(0.99),
+            result_latency_ms_p50: result_latency_percentile(0.50),
+            result_latency_ms_p95: result_latency_percentile(0.95),
+            result_latency_ms_p99: result_latency_percentile(0.99),
         }
     }
 
@@ -175,15 +186,16 @@ mod tests {
     }
 
     #[test]
-    fn tracker_separates_finalization_horizon_from_latency_baseline() {
+    fn tracker_reports_result_latency_and_semantics_baseline_overhead() {
         let property = VarName::new("p");
-        let mut tracker = LatencyTracker::new(1_000, 0, [property.clone()]);
+        let mut tracker = LatencyTracker::new(1_000, 1_000, [property.clone()]);
         tracker.record_input(0);
         tracker.record_output(tracker.property_id(&property).unwrap(), 0);
         tracker.record_input(1_000_000_000);
         let summary = tracker.summary(0);
         assert_eq!(summary.latency_expected_samples, 1);
-        assert!(summary.latency_overhead_ms_p50.unwrap() >= 0.0);
+        assert!(summary.result_latency_ms_p50.unwrap() >= 0.0);
+        assert_eq!(summary.latency_overhead_ms_p50, Some(0.0));
     }
 
     fn summary_with(samples: u64, expected_samples: u64) -> LatencySummary {
@@ -195,6 +207,9 @@ mod tests {
             latency_overhead_ms_p50: None,
             latency_overhead_ms_p95: None,
             latency_overhead_ms_p99: None,
+            result_latency_ms_p50: None,
+            result_latency_ms_p95: None,
+            result_latency_ms_p99: None,
         }
     }
 

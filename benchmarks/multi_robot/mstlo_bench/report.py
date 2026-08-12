@@ -24,6 +24,9 @@ SUMMARY_COLUMNS = (
     "latency_overhead_ms_p50_mean",
     "latency_overhead_ms_p95_mean",
     "latency_overhead_ms_p99_mean",
+    "result_latency_ms_p50_mean",
+    "result_latency_ms_p95_mean",
+    "result_latency_ms_p99_mean",
 )
 COVERAGE_COLUMNS = (
     "semantics",
@@ -78,6 +81,12 @@ def aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 **{
                     f"latency_overhead_ms_{percentile}_mean": fmean(
                         row[f"latency_overhead_ms_{percentile}"] for row in group
+                    )
+                    for percentile in PERCENTILES
+                },
+                **{
+                    f"result_latency_ms_{percentile}_mean": fmean(
+                        row[f"result_latency_ms_{percentile}"] for row in group
                     )
                     for percentile in PERCENTILES
                 },
@@ -165,12 +174,22 @@ def write_report(output_dir: Path, report_dir: Path | None = None) -> list[Path]
     report_dir.mkdir(parents=True, exist_ok=True)
     csv_path = report_dir / "latency.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(summary)
 
     markdown_path = report_dir / "latency.md"
-    lines = ["# Latency report", "", "## Series coverage", ""]
+    lines = [
+        "# Latency report",
+        "",
+        "- **Latency overhead:** `max(0, time to first result - semantics baseline)`, where",
+        "  delayed and eager semantics use the property horizon and RoSI uses zero.",
+        "- **Time to first result:** elapsed wall-clock time from publication of an evaluation",
+        "  timestamp to arrival of its first valid result.",
+        "",
+        "## Series coverage",
+        "",
+    ]
     lines.extend(_table(coverage, COVERAGE_COLUMNS))
     lines.extend(
         [

@@ -13,7 +13,7 @@ Three benchmarks for [MSTLO](https://github.com/INTO-CPS-Association/mstlo), eac
 
 | benchmark | what it measures | run it |
 | --- | --- | --- |
-| [**multi-robot**](benchmarks/multi_robot/README.md) | MSTLO latency overhead, in-process vs. ROS 2 | `docker compose run --rm multi_robot run` |
+| [**multi-robot**](benchmarks/multi_robot/README.md) | MSTLO latency overhead and time to first result, in-process vs. ROS 2 | `docker compose run --rm multi_robot run` |
 | [**synthetic signal**](benchmarks/synthetic_signal/README.md) | how monitoring cost scales with the temporal depth of a formula, across four semantics | `docker compose run --rm synthetic_signal run` |
 | [**incubator**](benchmarks/incubator/README.md) | monitoring a recorded digital-twin temperature trace, plus the monitor's memory footprint | `docker compose run --rm incubator run` |
 
@@ -113,7 +113,7 @@ The multi-robot benchmark was run on an Intel Core Ultra 7 155H (22 cores, 7.1.7
 **[latency_overhead_fan_eager-qualitative.png](example-results/multi_robot/default-20260811T211413Z-541108f6/report/latency_overhead_fan_eager-qualitative.png)**  
 **[latency_overhead_fan_robustness-interval.png](example-results/multi_robot/default-20260811T211413Z-541108f6/report/latency_overhead_fan_robustness-interval.png)**  
 
-A few things about the eager-qualitative figures are worth calling out: the overhead numbers for the `dwell` and `occupancy` property sets are clearly wrong, in a way that suggests an arithmetic bug rather than a valid measurement. The other three semantics are consistent and plausible.
+The report tables include time to first result alongside corrected latency overhead for direct eager-versus-delayed comparison.
 
 For results on the synthetic-signal and incubator benchmarks we refer to the paper. The containers in this repository are the reproduction mechanism — they make it trivial to re-run every experiment — but the results reported in the paper were obtained directly on the host, without Docker.
 

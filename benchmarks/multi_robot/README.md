@@ -1,12 +1,13 @@
 # Multi-robot
 
-MSTLO latency overhead through an in-process direct input path and a ROS 2 input path. Both paths use the same Brownian robot source, properties, algorithm, semantics, and publication schedule, so the difference between them is the transport. The reported metric is
+MSTLO latency through an in-process direct input path and a ROS 2 input path. Both paths use the same Brownian robot source, properties, algorithm, semantics, and publication schedule. Two metrics are calculated from each first-result sample:
 
 ```text
-first valid verdict arrival - earliest time the semantics permits a verdict
+latency overhead     = max(0, time to first result - semantics baseline)
+time to first result = first valid result arrival - publication of its evaluation timestamp
 ```
 
-Later RoSI refinements at the same property/timestamp are ignored, so every semantics is weighted the same. Delayed semantics exclude their required waiting period; eager and robustness-interval semantics have no fixed wait. A run fails if a verdict has the wrong payload type.
+Delayed and eager semantics use the property horizon as their latency-overhead baseline; RoSI uses zero. The report tables contain both metrics, while plots show latency overhead. Later RoSI refinements at the same property/timestamp are ignored, so every semantics is weighted equally. A run fails if a result has the wrong payload type.
 
 This is the one benchmark that needs ROS 2, so its image is built by `docker/Dockerfile` rather than the one the other two share. Everything else about running it is what they do — the compose service is the benchmark, and a command names the stage:
 
@@ -75,7 +76,7 @@ results/multi_robot/
 └── latest -> quick-20260809T120000Z-a1b2c3d4
 ```
 
-The directory is printed when the stage starts. The report is one CSV, one Markdown report, and one fan plot per configured MSTLO semantics.
+The directory is printed when the stage starts. The report is one CSV, one Markdown report, and one latency-overhead plot per configured MSTLO semantics. The tables include time to first result for eager-versus-delayed comparison.
 
 `analyze` writes into the newest run, so a report can be redrawn at any time without measuring again. Name a run — or a config, or `latest`, or a path — to report on that one instead, and `REPORT_DIR` puts the files somewhere else:
 

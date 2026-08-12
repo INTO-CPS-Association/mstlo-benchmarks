@@ -64,10 +64,12 @@ enum SemanticsArg {
 }
 
 impl SemanticsArg {
-    fn latency_baseline_ms(self, finalization_horizon_ms: u64) -> u64 {
+    fn latency_baseline_ms(self, property_horizon_ms: u64) -> u64 {
         match self {
-            Self::EagerQualitative | Self::RobustnessInterval => 0,
-            Self::DelayedQualitative | Self::DelayedQuantitative => finalization_horizon_ms,
+            Self::RobustnessInterval => 0,
+            Self::DelayedQualitative | Self::DelayedQuantitative | Self::EagerQualitative => {
+                property_horizon_ms
+            }
         }
     }
 
@@ -94,6 +96,32 @@ impl SemanticsArg {
                     && value.interval_lower <= value.interval_upper
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod semantics_tests {
+    use super::SemanticsArg;
+
+    #[test]
+    fn latency_baseline_uses_the_property_horizon_except_for_rosi() {
+        let horizon_ms = 10_000;
+        assert_eq!(
+            SemanticsArg::DelayedQualitative.latency_baseline_ms(horizon_ms),
+            horizon_ms
+        );
+        assert_eq!(
+            SemanticsArg::DelayedQuantitative.latency_baseline_ms(horizon_ms),
+            horizon_ms
+        );
+        assert_eq!(
+            SemanticsArg::EagerQualitative.latency_baseline_ms(horizon_ms),
+            horizon_ms
+        );
+        assert_eq!(
+            SemanticsArg::RobustnessInterval.latency_baseline_ms(horizon_ms),
+            0
+        );
     }
 }
 

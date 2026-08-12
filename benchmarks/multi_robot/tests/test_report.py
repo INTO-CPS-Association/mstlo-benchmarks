@@ -2,6 +2,7 @@ import csv
 import json
 import math
 
+import pytest
 from mstlo_bench.report import _series_values, aggregate, series_coverage, write_report
 
 
@@ -18,6 +19,9 @@ def row(transport, seed, semantics, p50, p95, p99):
         "latency_overhead_ms_p50": p50,
         "latency_overhead_ms_p95": p95,
         "latency_overhead_ms_p99": p99,
+        "result_latency_ms_p50": p50,
+        "result_latency_ms_p95": p95,
+        "result_latency_ms_p99": p99,
     }
 
 
@@ -104,6 +108,27 @@ semantics = ["delayed-qualitative", "robustness-interval"]
     assert result["runs"] == "1"
     assert result["expected_runs"] == "2"
     assert result["complete"] == "False"
+
+
+def test_report_aggregates_dual_metric_rows():
+    item = row("direct", 1, "eager-qualitative", 0, 2, 4)
+    item.update(
+        {
+            "result_latency_ms_p50": 10_000,
+            "result_latency_ms_p95": 10_002,
+            "result_latency_ms_p99": 10_004,
+        }
+    )
+    summary = aggregate([item])
+    assert summary[0]["latency_overhead_ms_p95_mean"] == 2
+    assert summary[0]["result_latency_ms_p95_mean"] == 10_002
+
+
+def test_report_rejects_missing_metrics():
+    item = row("direct", 1, "eager-qualitative", 0, 2, 4)
+    del item["result_latency_ms_p95"]
+    with pytest.raises(KeyError, match="result_latency_ms_p95"):
+        aggregate([item])
 
 
 def test_series_values_leave_gaps_for_incomplete_robot_counts():
