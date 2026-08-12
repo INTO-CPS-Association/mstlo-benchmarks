@@ -1,6 +1,6 @@
 [benchmark]
-robots = [1, 2, 5, 10, 20, 50, 100]
-seeds = [123, 456, 789]
+robots = [100, 50, 20, 10, 5, 1]
+seeds = [123, 456]
 property_sets = ["confined", "dwell", "occupancy"]
 transports = ["direct", "ros"]
 semantics = [
@@ -10,7 +10,7 @@ semantics = [
   "robustness-interval",
 ]
 algorithm = "incremental"
-duration_s = 120.0
+duration_s = 20.0
 publish_rate_hz = 20.0
 sim_hz = 60.0
 window_s = 10.0
@@ -19,4 +19,4 @@ dwell_s = 5.0
 [ros]
 discovery_s = 2.0
 checker_settle_s = 2.0
-drain_s = 2.0
+drain_s = 10.0
